@@ -316,17 +316,9 @@ impl ServerState {
                         tube.stat.total_jobs_ct += 1;
                     }
                 }
-                JobState::Reserved => {
-                    // Reserved jobs replay as Ready (handled by WAL deserialization)
-                    // This shouldn't happen, but handle it gracefully
-                    let key = (pri, id);
-                    self.insert_job(id, job);
-                    if let Some(tube) = self.tubes.get_mut(&tube_name) {
-                        tube.ready.insert(key, id);
-                    }
-                    self.ready_ct += 1;
-                    self.stats.total_jobs_ct += 1;
-                }
+                JobState::Reserved => unreachable!(
+                    "WAL deserialization translates Reserved -> Ready before restore_jobs"
+                ),
             }
 
             // Register concurrency limit
