@@ -157,6 +157,12 @@ struct ServerState {
     /// Optional cap on total in-memory job bytes (bodies + overhead + tombstones).
     /// `None` disables the check.
     max_job_bytes: Option<u64>,
+    /// Optional combined disk budget for the WAL + body store (bytes). When
+    /// set, `cmd_put` returns `OUT_OF_STORAGE` once the budget — minus a
+    /// reserved slice for state-change records — would be exceeded. State
+    /// changes (delete, release, bury, kick, touch) ignore this cap.
+    /// `None` disables the check, matching pre-Phase-3C behaviour.
+    max_storage_bytes: Option<u64>,
     /// Running sum of `job_memory_cost` for all jobs plus `tombstone_memory_cost`
     /// for every live idempotency-cooldown entry. Maintained via the
     /// `insert_job` / `take_job` / `delete_job` / `insert_tombstone` / `remove_tombstone`
@@ -192,7 +198,12 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn new(max_job_size: u32, max_job_bytes: Option<u64>, name: Option<String>) -> Self {
+    fn new(
+        max_job_size: u32,
+        max_job_bytes: Option<u64>,
+        max_storage_bytes: Option<u64>,
+        name: Option<String>,
+    ) -> Self {
         let mut tubes = HashMap::new();
         tubes.insert("default".to_string(), Tube::new("default"));
 
@@ -271,6 +282,7 @@ impl ServerState {
 
             max_job_size,
             max_job_bytes,
+            max_storage_bytes,
             total_job_bytes: 0,
             drain_mode: false,
             ready_ct: 0,
@@ -345,6 +357,36 @@ impl ServerState {
             Some(limit) => self.total_job_bytes.saturating_add(additional) > limit,
             None => false,
         }
+    }
+
+    /// True iff a put of `body_len` bytes would push WAL + TOAST disk usage
+    /// past the configured budget, accounting for a one-segment WAL reserve.
+    /// Returns false (allow) when `max_storage_bytes` is `None` or the WAL
+    /// is disabled (no `-b`). Body-store overhead is approximated as a
+    /// constant; this is a soft fence, not a tight ceiling.
+    fn storage_limit_exceeded(&self, body_len: u64) -> bool {
+        let limit = match self.max_storage_bytes {
+            Some(l) => l,
+            None => return false,
+        };
+        let wal = match self.wal.as_ref() {
+            Some(w) => w,
+            None => return false,
+        };
+        // Per-body TOAST overhead: 20-byte header + worst-case file-header
+        // amortisation (~16 bytes per body if every put rotated).
+        const BODY_OVERHEAD: u64 = 64;
+        let toast_bytes = self.body_store.as_ref().map_or(0, |bs| bs.total_bytes());
+        let wal_bytes = wal.total_disk_bytes();
+        // Reserve: one WAL segment's worth, capped at 10 MB so very small
+        // segment configurations still leave room for state-change churn.
+        let wal_reserve = (wal.max_file_size() as u64).max(10 * 1024 * 1024);
+        let projected = wal_bytes
+            .saturating_add(toast_bytes)
+            .saturating_add(body_len)
+            .saturating_add(BODY_OVERHEAD)
+            .saturating_add(wal_reserve);
+        projected > limit
     }
 
     fn insert_job(&mut self, id: u64, job: Job) {
@@ -746,8 +788,7 @@ impl ServerState {
         //
         // When persistence is on, body bytes leave RAM and live in the
         // external body store, so they don't count toward the in-memory
-        // budget. (Disk-budget enforcement for TOAST is a separate
-        // forthcoming check, not this one.)
+        // budget. The disk side is enforced separately just below.
         let tombstone_cost = idempotency_key
             .as_ref()
             .filter(|(_, ttl)| *ttl > 0)
@@ -761,6 +802,15 @@ impl ServerState {
         let job_cost = body_in_ram + JOB_OVERHEAD_BYTES;
         if self.memory_limit_exceeded(job_cost + tombstone_cost) {
             return Response::OutOfMemory;
+        }
+
+        // Storage budget: combined WAL + TOAST disk usage must stay under
+        // `--max-storage-bytes`, with one WAL segment's worth of headroom
+        // reserved so deletes/releases can always be journalled — that
+        // reserve is what lets `OUT_OF_STORAGE` be recoverable rather than
+        // a deadlock. State-change records bypass this check entirely.
+        if self.storage_limit_exceeded(body.len() as u64) {
+            return Response::OutOfStorage;
         }
 
         // Mark connection as producer
@@ -2787,11 +2837,12 @@ pub fn parse_bytes(s: &str) -> Result<u64, String> {
 fn build_state(
     max_job_size: u32,
     max_job_bytes: Option<u64>,
+    max_storage_bytes: Option<u64>,
     wal_dir: Option<&Path>,
     wal_sync_interval: Duration,
     name: Option<String>,
 ) -> io::Result<ServerState> {
-    let mut state = ServerState::new(max_job_size, max_job_bytes, name);
+    let mut state = ServerState::new(max_job_size, max_job_bytes, max_storage_bytes, name);
 
     if let Some(dir) = wal_dir {
         // Body store sits next to the WAL in `<dir>/toast/`. Open it
@@ -2895,6 +2946,7 @@ pub async fn run(
     port: u16,
     max_job_size: u32,
     max_job_bytes: Option<u64>,
+    max_storage_bytes: Option<u64>,
     wal_dir: Option<&str>,
     wal_sync_interval: Duration,
     metrics_port: Option<u16>,
@@ -2904,6 +2956,7 @@ pub async fn run(
     let state = build_state(
         max_job_size,
         max_job_bytes,
+        max_storage_bytes,
         wal_path,
         wal_sync_interval,
         name.clone(),
@@ -2913,6 +2966,9 @@ pub async fn run(
     let mut opts = format!(" max-job-size={max_job_size}");
     if let Some(b) = max_job_bytes {
         opts.push_str(&format!(" max-jobs-size={b}"));
+    }
+    if let Some(b) = max_storage_bytes {
+        opts.push_str(&format!(" max-storage-bytes={b}"));
     }
     if let Some(ref dir) = wal_dir {
         opts.push_str(&format!(" binlog={dir}"));
@@ -2965,22 +3021,24 @@ pub async fn run_with_listener(
     wal_dir: Option<&Path>,
     name: Option<String>,
 ) -> io::Result<()> {
-    run_with_listener_limited(listener, max_job_size, None, wal_dir, name).await
+    run_with_listener_limited(listener, max_job_size, None, None, wal_dir, name).await
 }
 
-/// Like [`run_with_listener`] but with an explicit `max_job_bytes` budget.
-/// Exists so integration tests can exercise the memory limit without going
-/// through the `run` CLI path.
+/// Like [`run_with_listener`] but with explicit memory and storage budgets.
+/// Exists so integration tests can exercise the budget enforcement paths
+/// without going through the `run` CLI path.
 pub async fn run_with_listener_limited(
     listener: TcpListener,
     max_job_size: u32,
     max_job_bytes: Option<u64>,
+    max_storage_bytes: Option<u64>,
     wal_dir: Option<&Path>,
     name: Option<String>,
 ) -> io::Result<()> {
     let state = build_state(
         max_job_size,
         max_job_bytes,
+        max_storage_bytes,
         wal_dir,
         crate::wal::DEFAULT_SYNC_INTERVAL,
         name,

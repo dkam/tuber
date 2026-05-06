@@ -1,7 +1,7 @@
 use super::*;
 
 fn make_state() -> ServerState {
-    ServerState::new(65535, None, None)
+    ServerState::new(65535, None, None, None)
 }
 
 fn register(state: &mut ServerState) -> u64 {
@@ -1586,7 +1586,7 @@ fn recompute_total_job_bytes(state: &ServerState) -> u64 {
 }
 
 fn make_state_with_limit(max_bytes: Option<u64>) -> ServerState {
-    ServerState::new(65535, max_bytes, None)
+    ServerState::new(65535, max_bytes, None, None)
 }
 
 #[test]

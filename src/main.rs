@@ -88,6 +88,21 @@ enum Commands {
         #[arg(long, value_parser = tuber::server::parse_bytes, env = "TUBER_MAX_JOBS_SIZE")]
         max_jobs_size: Option<u64>,
 
+        /// Maximum total on-disk size for the WAL + body store combined.
+        /// PUT returns OUT_OF_STORAGE once exceeded; reserve / release /
+        /// bury / kick / delete always succeed (they only ever shrink the
+        /// budget once compaction reclaims). One WAL segment's worth of
+        /// headroom is reserved so deletes can always be journalled.
+        /// Accepts suffixes: k, m, g, t (e.g. 100g, 50G).
+        /// Only meaningful when --binlog-dir is set; default: unlimited.
+        #[arg(
+            long,
+            value_parser = tuber::server::parse_bytes,
+            requires = "binlog_dir",
+            env = "TUBER_MAX_STORAGE_BYTES"
+        )]
+        max_storage_bytes: Option<u64>,
+
         /// Increase verbosity (-V for info, -VV for debug)
         #[arg(short = 'V', action = clap::ArgAction::Count, env = "TUBER_VERBOSE")]
         verbose: u8,
@@ -189,6 +204,7 @@ async fn main() {
             wal_sync_interval,
             max_job_size,
             max_jobs_size,
+            max_storage_bytes,
             verbose,
             metrics_port,
             name,
@@ -204,6 +220,7 @@ async fn main() {
                 port,
                 max_job_size,
                 max_jobs_size,
+                max_storage_bytes,
                 binlog_dir.as_deref(),
                 wal_sync_interval,
                 metrics_port,

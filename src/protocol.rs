@@ -118,6 +118,7 @@ pub enum Response {
     Paused,
     Flushed(u32),
     OutOfMemory,
+    OutOfStorage,
     InternalError,
     Draining,
     NotDraining,
@@ -177,6 +178,7 @@ impl Response {
             Response::Paused => buf.extend_from_slice(b"PAUSED\r\n"),
             Response::Flushed(n) => { let _ = write!(buf, "FLUSHED {n}\r\n"); }
             Response::OutOfMemory => buf.extend_from_slice(b"OUT_OF_MEMORY\r\n"),
+            Response::OutOfStorage => buf.extend_from_slice(b"OUT_OF_STORAGE\r\n"),
             Response::InternalError => buf.extend_from_slice(b"INTERNAL_ERROR\r\n"),
             Response::Draining => buf.extend_from_slice(b"DRAINING\r\n"),
             Response::NotDraining => buf.extend_from_slice(b"NOT_DRAINING\r\n"),

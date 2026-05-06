@@ -48,6 +48,37 @@ impl TestServer {
         }
     }
 
+    /// Start with an explicit `--max-storage-bytes` budget. Used to
+    /// exercise the disk-budget enforcement (`OUT_OF_STORAGE`).
+    async fn start_with_wal_and_storage_budget(dir: &Path, max_storage_bytes: u64) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let wal_dir = dir.to_path_buf();
+        let wal_dir_clone = wal_dir.clone();
+
+        let handle = tokio::spawn(async move {
+            tuber::server::run_with_listener_limited(
+                listener,
+                65535,
+                None,
+                Some(max_storage_bytes),
+                Some(wal_dir_clone.as_path()),
+                None,
+            )
+            .await
+            .ok();
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        TestServer {
+            port,
+            handle,
+            wal_dir,
+        }
+    }
+
     /// Start with an explicit `max_jobs_size` budget. Used to exercise the
     /// replay pre-check in src/server.rs:build_state.
     async fn try_start_with_wal_and_max_jobs_size(
@@ -67,6 +98,7 @@ impl TestServer {
                 listener,
                 65535,
                 Some(max_jobs_size),
+                None,
                 Some(wal_dir_clone.as_path()),
                 None,
             )
@@ -1008,4 +1040,68 @@ async fn test_binlog_toast_large_body_restart() {
     c2.mustsend("reserve-with-timeout 1\r\n").await;
     c2.ckresp(&format!("RESERVED 1 {}\r\n", len)).await;
     c2.ckresp(&format!("{}\r\n", body)).await;
+}
+
+/// `--max-storage-bytes`: once the combined WAL+TOAST footprint plus a
+/// one-segment WAL reserve (≈10 MB) would exceed the budget, new puts
+/// are refused with `OUT_OF_STORAGE`. State changes (delete) always
+/// succeed regardless of the budget — they're how the operator unsticks
+/// a wedged queue.
+#[tokio::test]
+async fn test_max_storage_bytes_returns_out_of_storage() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 13 MB budget: ~10 MB reserved for the WAL, ~3 MB headroom for
+    // bodies and WAL data. ~50 puts of 60 KiB should trip the cap.
+    let srv = TestServer::start_with_wal_and_storage_budget(dir.path(), 13 * 1024 * 1024).await;
+    let mut c = srv.connect().await;
+
+    let body = "x".repeat(60 * 1024); // 60 KiB — fits within default max-job-size
+    let len = body.len();
+    let mut accepted = 0u32;
+    let mut hit = false;
+    for _ in 0..200 {
+        c.mustsend(&format!("put 0 0 60 {}\r\n", len)).await;
+        c.mustsend(&format!("{}\r\n", body)).await;
+        let resp = c.readline().await;
+        if resp == "OUT_OF_STORAGE\r\n" {
+            hit = true;
+            break;
+        }
+        assert!(
+            resp.starts_with("INSERTED "),
+            "unexpected response: {:?}",
+            resp
+        );
+        accepted += 1;
+    }
+    assert!(
+        hit,
+        "expected OUT_OF_STORAGE within 200 puts, got {} accepted",
+        accepted
+    );
+    assert!(accepted >= 1, "at least one put should land before the cap");
+
+    // State changes never refused: delete an inserted job and confirm
+    // the response is DELETED, not OUT_OF_STORAGE.
+    c.mustsend("delete 1\r\n").await;
+    c.ckresp("DELETED\r\n").await;
+}
+
+/// Without `--max-storage-bytes`, the budget check is a no-op even when
+/// the WAL+TOAST footprint is large. Mirrors current production
+/// behaviour for operators who haven't opted into the cap yet.
+#[tokio::test]
+async fn test_no_storage_budget_lets_puts_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    let body = "y".repeat(60 * 1024);
+    let len = body.len();
+    for i in 0..50 {
+        c.mustsend(&format!("put 0 0 60 {}\r\n", len)).await;
+        c.mustsend(&format!("{}\r\n", body)).await;
+        c.ckresp(&format!("INSERTED {}\r\n", i + 1)).await;
+    }
 }
