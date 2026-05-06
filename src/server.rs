@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::body_store::BodyStore;
 use crate::conn::{ConnState, ReserveMode, WatchedTube};
-use crate::job::{Job, JobState, URGENT_THRESHOLD};
+use crate::job::{BodyRef, Job, JobState, URGENT_THRESHOLD};
 use crate::protocol::{self, Command, MAX_DELETE_BATCH, Response};
 use crate::tube::{Tube, TubeStats};
 use crate::wal::{IdpTombstone, StateChangeReason, Wal};
@@ -169,6 +171,10 @@ struct ServerState {
     waiters: Vec<WaitingReserve>,
     /// Optional write-ahead log for persistence.
     wal: Option<Wal>,
+    /// External body store ("TOAST"). Present iff `wal` is — bodies live
+    /// here when persistence is enabled, addressed by `BodyId` in the WAL's
+    /// `FullJob` records (v5+).
+    body_store: Option<Arc<BodyStore>>,
     /// Hex-encoded random instance ID (16 chars).
     instance_id: String,
     /// Optional user-assigned instance name.
@@ -273,6 +279,7 @@ impl ServerState {
             stats: GlobalStats::default(),
             waiters: Vec::new(),
             wal: None,
+            body_store: None,
             instance_id,
             name,
             hostname,
@@ -281,6 +288,26 @@ impl ServerState {
             groups: HashMap::new(),
             concurrency_keys: HashMap::new(),
             concurrency_limits: HashMap::new(),
+        }
+    }
+
+    /// Materialise a job's body bytes for the wire. Inline bodies are cloned
+    /// directly; external bodies are read from the body store. Returns
+    /// `None` if the body is external but the store is missing or the read
+    /// fails — call sites surface this as `Response::InternalError`.
+    fn fetch_body(&self, job: &Job) -> Option<Vec<u8>> {
+        match &job.body {
+            BodyRef::Inline(v) => Some(v.clone()),
+            BodyRef::External(id) => {
+                let bs = self.body_store.as_ref()?;
+                match bs.read_body(*id) {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        tracing::error!(body_id = id.0, "TOAST read failed: {}", e);
+                        None
+                    }
+                }
+            }
         }
     }
 
@@ -1057,9 +1084,17 @@ impl ServerState {
 
     fn do_reserve_inner(&mut self, conn_id: u64, job_id: u64) -> Response {
         let now = Instant::now();
-        let (body, tube_name, created_at) = match self.jobs.get_mut(&job_id) {
+        // Materialise the body before mutating job state — `fetch_body` may
+        // hit the body store and needs its own immutable borrow of self.
+        let body = match self.jobs.get(&job_id) {
+            Some(job) => match self.fetch_body(job) {
+                Some(b) => b,
+                None => return Response::InternalError,
+            },
+            None => return Response::NotFound,
+        };
+        let (tube_name, created_at) = match self.jobs.get_mut(&job_id) {
             Some(job) => {
-                let body = job.body_bytes().to_vec();
                 let tube_name = job.tube_name.clone();
                 let created_at = job.created_at;
                 job.state = JobState::Reserved;
@@ -1067,7 +1102,7 @@ impl ServerState {
                 job.reserved_at = Some(now);
                 job.deadline_at = Some(now + job.ttr);
                 job.reserve_ct += 1;
-                (body, tube_name, created_at)
+                (tube_name, created_at)
             }
             None => return Response::NotFound,
         };
@@ -1614,9 +1649,9 @@ impl ServerState {
 
     fn cmd_peek(&self, id: u64) -> Response {
         match self.jobs.get(&id) {
-            Some(job) => Response::Found {
-                id,
-                body: job.body_bytes().to_vec(),
+            Some(job) => match self.fetch_body(job) {
+                Some(body) => Response::Found { id, body },
+                None => Response::InternalError,
             },
             None => Response::NotFound,
         }
@@ -1632,9 +1667,9 @@ impl ServerState {
             && let Some(&(_, job_id)) = tube.ready.peek()
             && let Some(job) = self.jobs.get(&job_id)
         {
-            return Response::Found {
-                id: job_id,
-                body: job.body_bytes().to_vec(),
+            return match self.fetch_body(job) {
+                Some(body) => Response::Found { id: job_id, body },
+                None => Response::InternalError,
             };
         }
         Response::NotFound
@@ -1650,9 +1685,9 @@ impl ServerState {
             && let Some(&(_, job_id)) = tube.delay.peek()
             && let Some(job) = self.jobs.get(&job_id)
         {
-            return Response::Found {
-                id: job_id,
-                body: job.body_bytes().to_vec(),
+            return match self.fetch_body(job) {
+                Some(body) => Response::Found { id: job_id, body },
+                None => Response::InternalError,
             };
         }
         Response::NotFound
@@ -1668,9 +1703,9 @@ impl ServerState {
             && let Some(&job_id) = tube.buried.front()
             && let Some(job) = self.jobs.get(&job_id)
         {
-            return Response::Found {
-                id: job_id,
-                body: job.body_bytes().to_vec(),
+            return match self.fetch_body(job) {
+                Some(body) => Response::Found { id: job_id, body },
+                None => Response::InternalError,
             };
         }
         Response::NotFound
@@ -1688,10 +1723,13 @@ impl ServerState {
             .filter(|j| j.state == JobState::Reserved && j.tube_name == tube_name)
             .min_by_key(|j| j.id);
         match found {
-            Some(job) => Response::Found {
-                id: job.id,
-                body: job.body_bytes().to_vec(),
-            },
+            Some(job) => {
+                let id = job.id;
+                match self.fetch_body(job) {
+                    Some(body) => Response::Found { id, body },
+                    None => Response::InternalError,
+                }
+            }
             None => Response::NotFound,
         }
     }
@@ -2714,6 +2752,18 @@ fn build_state(
     let mut state = ServerState::new(max_job_size, max_job_bytes, name);
 
     if let Some(dir) = wal_dir {
+        // Body store sits next to the WAL in `<dir>/toast/`. Open it
+        // before the WAL so any v5 `BodyId` references in WAL records can
+        // resolve during replay. The directory is created on demand —
+        // existing operators upgrading without TOAST data will see an
+        // empty index, which is correct.
+        let toast_dir = dir.join("toast");
+        let body_store = Arc::new(
+            BodyStore::open(&toast_dir, crate::body_store::DEFAULT_SEGMENT_SIZE).map_err(
+                |e| io::Error::other(format!("opening body store at {:?}: {}", toast_dir, e)),
+            )?,
+        );
+
         let mut wal = Wal::open(
             dir,
             crate::wal::WalConfig {
@@ -2747,6 +2797,7 @@ fn build_state(
         }
 
         state.wal = Some(wal);
+        state.body_store = Some(body_store);
         tracing::info!(
             "WAL: replayed {} jobs and {} idempotency tombstones from {:?}",
             job_count,
