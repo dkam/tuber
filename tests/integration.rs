@@ -5191,44 +5191,33 @@ async fn test_many_waiters_concurrency_keyed_drain() {
         handles.push(tokio::spawn(async move {
             let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             stream.set_nodelay(true).unwrap();
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let mut buf = String::new();
+            let (reader, writer) = stream.into_split();
+            let mut conn = TestConn {
+                reader: BufReader::new(reader),
+                writer,
+            };
 
-            writer
-                .write_all(format!("watch {}\r\n", TUBE).as_bytes())
-                .await
-                .unwrap();
-            reader.read_line(&mut buf).await.unwrap();
-            buf.clear();
-            writer.write_all(b"ignore default\r\n").await.unwrap();
-            reader.read_line(&mut buf).await.unwrap();
-            buf.clear();
+            conn.mustsend(&format!("watch {}\r\n", TUBE)).await;
+            conn.readline().await;
+            conn.mustsend("ignore default\r\n").await;
+            conn.readline().await;
 
             loop {
-                writer
-                    .write_all(b"reserve-with-timeout 1\r\n")
-                    .await
-                    .unwrap();
-                buf.clear();
-                reader.read_line(&mut buf).await.unwrap();
-                if buf.starts_with("TIMED_OUT") || buf.starts_with("DEADLINE_SOON") {
+                conn.mustsend("reserve-with-timeout 1\r\n").await;
+                let line = conn.readline().await;
+                if line.starts_with("TIMED_OUT") || line.starts_with("DEADLINE_SOON") {
                     break;
                 }
-                assert!(buf.starts_with("RESERVED "), "{:?}", buf);
-                let parts: Vec<&str> = buf.trim_end().split_whitespace().collect();
+                assert!(line.starts_with("RESERVED "), "{:?}", line);
+                let parts: Vec<&str> = line.trim_end().split_whitespace().collect();
                 let id: u64 = parts[1].parse().unwrap();
                 let body_len: usize = parts[2].parse().unwrap();
                 let mut body_buf = vec![0u8; body_len + 2];
-                reader.read_exact(&mut body_buf).await.unwrap();
+                conn.reader.read_exact(&mut body_buf).await.unwrap();
 
-                writer
-                    .write_all(format!("delete {}\r\n", id).as_bytes())
-                    .await
-                    .unwrap();
-                buf.clear();
-                reader.read_line(&mut buf).await.unwrap();
-                assert!(buf.starts_with("DELETED"), "{:?}", buf);
+                conn.mustsend(&format!("delete {}\r\n", id)).await;
+                let line = conn.readline().await;
+                assert!(line.starts_with("DELETED"), "{:?}", line);
                 consumed.fetch_add(1, Ordering::Relaxed);
             }
         }));

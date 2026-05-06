@@ -30,6 +30,19 @@ fn put_cmd(pri: u32, delay: u32, ttr: u32, bytes: u32) -> Command {
     }
 }
 
+fn put_con_cmd(pri: u32, ttr: u32, bytes: u32, key: &str, limit: u32) -> Command {
+    Command::Put {
+        pri,
+        delay: 0,
+        ttr,
+        bytes,
+        idempotency_key: None,
+        group: None,
+        after_group: None,
+        concurrency_key: Some((key.to_string(), limit)),
+    }
+}
+
 #[test]
 fn test_put_and_reserve() {
     let mut s = make_state();
@@ -597,17 +610,11 @@ fn test_concurrency_key_limit_n() {
     let c2 = register(&mut s);
 
     let con_put = |s: &mut ServerState, conn: u64, body: &[u8]| {
-        let cmd = Command::Put {
-            pri: 0,
-            delay: 0,
-            ttr: 120,
-            bytes: body.len() as u32,
-            idempotency_key: None,
-            group: None,
-            after_group: None,
-            concurrency_key: Some(("api".into(), 2)),
-        };
-        s.handle_command(conn, cmd, Some(body.to_vec()))
+        s.handle_command(
+            conn,
+            put_con_cmd(0, 120, body.len() as u32, "api", 2),
+            Some(body.to_vec()),
+        )
     };
 
     // Insert 3 jobs
@@ -643,17 +650,11 @@ fn test_concurrency_key_default_limit_one() {
     let c2 = register(&mut s);
 
     let con_put = |s: &mut ServerState, conn: u64, body: &[u8]| {
-        let cmd = Command::Put {
-            pri: 0,
-            delay: 0,
-            ttr: 120,
-            bytes: body.len() as u32,
-            idempotency_key: None,
-            group: None,
-            after_group: None,
-            concurrency_key: Some(("single".into(), 1)),
-        };
-        s.handle_command(conn, cmd, Some(body.to_vec()))
+        s.handle_command(
+            conn,
+            put_con_cmd(0, 120, body.len() as u32, "single", 1),
+            Some(body.to_vec()),
+        )
     };
 
     con_put(&mut s, c1, b"j1");
@@ -678,17 +679,11 @@ fn test_cmd_delete_wakes_concurrency_waiter() {
     let c2 = register(&mut s);
 
     let con_put = |s: &mut ServerState, conn: u64, body: &[u8]| {
-        let cmd = Command::Put {
-            pri: 0,
-            delay: 0,
-            ttr: 120,
-            bytes: body.len() as u32,
-            idempotency_key: None,
-            group: None,
-            after_group: None,
-            concurrency_key: Some(("k".into(), 1)),
-        };
-        s.handle_command(conn, cmd, Some(body.to_vec()))
+        s.handle_command(
+            conn,
+            put_con_cmd(0, 120, body.len() as u32, "k", 1),
+            Some(body.to_vec()),
+        )
     };
 
     con_put(&mut s, c1, b"j1");
@@ -730,26 +725,14 @@ fn test_find_unblocked_returns_smallest_unblocked() {
     let c1 = register(&mut s);
     let _c2 = register(&mut s);
 
-    // j1: pri 1, con:k (blocks)
-    // j2: pri 2, no con      <- this is the smallest unblocked
-    // j3: pri 0, con:k (also blocked)  <- smallest overall but blocked
-    let put = |s: &mut ServerState, conn: u64, pri: u32, con: Option<(&str, u32)>, body: &[u8]| {
-        let cmd = Command::Put {
-            pri,
-            delay: 0,
-            ttr: 120,
-            bytes: body.len() as u32,
-            idempotency_key: None,
-            group: None,
-            after_group: None,
-            concurrency_key: con.map(|(k, n)| (k.to_string(), n)),
-        };
-        s.handle_command(conn, cmd, Some(body.to_vec()))
+    // j1: pri 1 con:k (blocks); j2: pri 2 unblocked (target);
+    // j3: pri 0 con:k (smallest overall but blocked).
+    let send = |s: &mut ServerState, cmd: Command, body: &[u8]| {
+        s.handle_command(c1, cmd, Some(body.to_vec()))
     };
-
-    assert!(matches!(put(&mut s, c1, 1, Some(("k", 1)), b"a"), Response::Inserted(1)));
-    assert!(matches!(put(&mut s, c1, 2, None,             b"b"), Response::Inserted(2)));
-    assert!(matches!(put(&mut s, c1, 0, Some(("k", 1)), b"c"), Response::Inserted(3)));
+    assert!(matches!(send(&mut s, put_con_cmd(1, 120, 1, "k", 1), b"a"), Response::Inserted(1)));
+    assert!(matches!(send(&mut s, put_cmd(2, 0, 120, 1),          b"b"), Response::Inserted(2)));
+    assert!(matches!(send(&mut s, put_con_cmd(0, 120, 1, "k", 1), b"c"), Response::Inserted(3)));
 
     // Reserve j3 (pri 0) — takes the con:k slot.
     let r = s.handle_command(c1, Command::Reserve, None);
