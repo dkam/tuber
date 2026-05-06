@@ -1,3 +1,4 @@
+pub mod body_store;
 pub mod client;
 pub mod cmd_put;
 pub mod cmd_stats;
