@@ -7,18 +7,13 @@ pub const URGENT_THRESHOLD: u32 = 1024;
 pub const JOB_DATA_SIZE_LIMIT_DEFAULT: u32 = 65535;
 pub const JOB_DATA_SIZE_LIMIT_MAX: u32 = 1_073_741_824;
 
-/// Logical identifier for a body stored in the (future) external body store.
-/// Monotonic and never reused. Phase 2 placeholder — only `BodyRef::External`
-/// will carry one, and that variant is not constructed yet.
+/// Logical identifier for a body stored in the external body store
+/// (`BodyStore`). Monotonic and never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BodyId(pub u64);
 
-/// Where a job's body lives.
-///
-/// In the current single-store design every body is `Inline`. The `External`
-/// variant exists so that future TOAST work can swap in body-store references
-/// without changing this enum's shape — for now any code path encountering
-/// `External` panics via `unreachable!`.
+/// Where a job's body lives. `Inline` carries the bytes in-process;
+/// `External` references a body owned by the `BodyStore` (TOAST).
 #[derive(Debug, Clone)]
 pub enum BodyRef {
     Inline(Vec<u8>),
@@ -26,18 +21,9 @@ pub enum BodyRef {
 }
 
 impl BodyRef {
-    /// Borrow the inline body bytes. Panics on `External` — Phase 2 invariant
-    /// is that `External` is never constructed.
-    pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            BodyRef::Inline(v) => v,
-            BodyRef::External(_) => unreachable!("body store not yet enabled"),
-        }
-    }
-
-    /// Number of body bytes resident in RAM. `Inline` returns the actual
-    /// body length; `External` returns 0 because those bytes live in the
-    /// body store, not in this `Job`. Drives in-memory budget accounting.
+    /// Number of body bytes resident in RAM. `External` returns 0 because
+    /// those bytes live in the body store, not this `Job`. Drives the
+    /// in-memory budget accounting.
     pub fn len(&self) -> usize {
         match self {
             BodyRef::Inline(v) => v.len(),
@@ -47,6 +33,23 @@ impl BodyRef {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// If this is `Inline`, take its bytes and replace the slot with an
+    /// empty `Inline`. Returns `None` for `External`. Used by the v4→v5
+    /// replay migration to lift inline bytes into the body store without
+    /// fighting the borrow checker.
+    pub fn take_inline(&mut self) -> Option<Vec<u8>> {
+        match self {
+            BodyRef::Inline(_) => {
+                let placeholder = BodyRef::Inline(Vec::new());
+                let BodyRef::Inline(bytes) = std::mem::replace(self, placeholder) else {
+                    unreachable!()
+                };
+                Some(bytes)
+            }
+            BodyRef::External(_) => None,
+        }
     }
 }
 
@@ -176,11 +179,6 @@ impl Job {
 
     pub fn body_size(&self) -> usize {
         self.body.len()
-    }
-
-    /// Borrow the body bytes. Panics on `External` (Phase 2 invariant).
-    pub fn body_bytes(&self) -> &[u8] {
-        self.body.as_bytes()
     }
 }
 
@@ -320,19 +318,22 @@ mod tests {
             b"hello-toast".to_vec(),
             "default".into(),
         );
-        // Constructor wraps incoming bytes in BodyRef::Inline.
-        assert!(matches!(job.body, BodyRef::Inline(_)));
-        assert_eq!(job.body_bytes(), b"hello-toast");
+        let BodyRef::Inline(ref bytes) = job.body else {
+            panic!("Job::new must produce Inline body");
+        };
+        assert_eq!(bytes, b"hello-toast");
         assert_eq!(job.body_size(), 11);
     }
 
     #[test]
-    #[should_panic(expected = "body store not yet enabled")]
-    fn test_body_ref_external_unreachable() {
-        // External is defined but no code path constructs it in Phase 2.
-        // Touching its bytes panics with the documented message.
-        let body = BodyRef::External(BodyId(123));
-        let _ = body.as_bytes();
+    fn test_body_ref_take_inline() {
+        let mut inline = BodyRef::Inline(b"abc".to_vec());
+        assert_eq!(inline.take_inline().as_deref(), Some(&b"abc"[..]));
+        assert!(matches!(inline, BodyRef::Inline(ref v) if v.is_empty()));
+
+        let mut external = BodyRef::External(BodyId(7));
+        assert!(external.take_inline().is_none());
+        assert!(matches!(external, BodyRef::External(BodyId(7))));
     }
 
     #[test]

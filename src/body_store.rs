@@ -76,6 +76,15 @@ impl std::fmt::Display for BodyStoreError {
 
 impl std::error::Error for BodyStoreError {}
 
+impl From<BodyStoreError> for io::Error {
+    fn from(e: BodyStoreError) -> Self {
+        match e {
+            BodyStoreError::Io(io_err) => io_err,
+            other => io::Error::other(other.to_string()),
+        }
+    }
+}
+
 // --- Types ---
 
 /// Where a body lives on disk. Stable across restarts (the index is
@@ -257,6 +266,22 @@ impl BodyStore {
     /// compaction; deleting an unknown id is a silent no-op.
     pub fn delete(&self, id: BodyId) {
         let mut inner = self.inner.lock().unwrap();
+        Self::delete_locked(&mut inner, id);
+    }
+
+    /// Bulk delete that takes the inner lock once. Hot for `flush-tube`
+    /// and replay-time orphan cleanup.
+    pub fn delete_many(&self, ids: &[BodyId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        for id in ids {
+            Self::delete_locked(&mut inner, *id);
+        }
+    }
+
+    fn delete_locked(inner: &mut Inner, id: BodyId) {
         if let Some(loc) = inner.index.remove(&id)
             && let Some(seg) = inner.segments.get_mut(&loc.seq)
         {

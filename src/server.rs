@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::body_store::BodyStore;
 use crate::conn::{ConnState, ReserveMode, WatchedTube};
-use crate::job::{BodyRef, Job, JobState, URGENT_THRESHOLD};
+use crate::job::{BodyId, BodyRef, Job, JobState, URGENT_THRESHOLD};
 use crate::protocol::{self, Command, MAX_DELETE_BATCH, Response};
 use crate::tube::{Tube, TubeStats};
 use crate::wal::{IdpTombstone, StateChangeReason, Wal};
@@ -159,7 +159,7 @@ struct ServerState {
     max_job_bytes: Option<u64>,
     /// Running sum of `job_memory_cost` for all jobs plus `tombstone_memory_cost`
     /// for every live idempotency-cooldown entry. Maintained via the
-    /// `insert_job` / `remove_job` / `insert_tombstone` / `remove_tombstone`
+    /// `insert_job` / `take_job` / `delete_job` / `insert_tombstone` / `remove_tombstone`
     /// helpers — the raw HashMap must not be mutated directly.
     total_job_bytes: u64,
     drain_mode: bool,
@@ -311,6 +311,17 @@ impl ServerState {
         }
     }
 
+    /// Wrap a `peek*` lookup in a `Response`. Returns `Found` when the
+    /// body materialises, `InternalError` when an external body cannot be
+    /// read.
+    fn found_or_error(&self, job: &Job) -> Response {
+        let id = job.id;
+        match self.fetch_body(job) {
+            Some(body) => Response::Found { id, body },
+            None => Response::InternalError,
+        }
+    }
+
     // --- Memory accounting ---
     //
     // All mutations of `self.jobs` and `tube.idempotency_cooldowns` MUST go
@@ -343,28 +354,25 @@ impl ServerState {
         self.jobs.insert(id, job);
     }
 
-    fn remove_job(&mut self, id: u64) -> Option<Job> {
+    /// Take a job out of the map for short-lived bookkeeping (the caller
+    /// re-inserts it before yielding control). Does NOT drop the external
+    /// body — see `delete_job` for permanent removal.
+    fn take_job(&mut self, id: u64) -> Option<Job> {
         let job = self.jobs.remove(&id)?;
         self.total_job_bytes = self
             .total_job_bytes
             .saturating_sub(Self::job_memory_cost(&job));
-        // Drop the external body once the job is gone — the WAL's
-        // `wal_write_put` helper takes a job out and reinserts it during
-        // tracking updates, so we only release the body when the *caller*
-        // is genuinely deleting (the job won't be reinserted).
-        // Callers that round-trip a Job through this helper (compaction,
-        // bookkeeping) must put the job back via `insert_job` before
-        // anything else looks at it.
         Some(job)
     }
 
-    /// Release the external body for a job that's being permanently
-    /// removed (delete, idempotency expiry on a deleted-and-tombstoned
-    /// job). No-op for inline bodies and for jobs in no-`-b` mode.
-    fn release_external_body(&self, job: &Job) {
-        if let (BodyRef::External(id), Some(bs)) = (&job.body, self.body_store.as_ref()) {
-            bs.delete(*id);
+    /// Permanently remove a job and reclaim its external body if any.
+    /// The single correct entry point for delete/flush/expiry paths.
+    fn delete_job(&mut self, id: u64) -> Option<Job> {
+        let job = self.take_job(id)?;
+        if let (BodyRef::External(body_id), Some(bs)) = (&job.body, self.body_store.as_ref()) {
+            bs.delete(*body_id);
         }
+        Some(job)
     }
 
     fn insert_tombstone(
@@ -738,8 +746,8 @@ impl ServerState {
         //
         // When persistence is on, body bytes leave RAM and live in the
         // external body store, so they don't count toward the in-memory
-        // budget. The disk-budget enforcement for TOAST is its own check
-        // (see Phase 3C / `--max-storage-bytes`).
+        // budget. (Disk-budget enforcement for TOAST is a separate
+        // forthcoming check, not this one.)
         let tombstone_cost = idempotency_key
             .as_ref()
             .filter(|(_, ttl)| *ttl > 0)
@@ -844,7 +852,6 @@ impl ServerState {
             let idp_key_str = idempotency_key.as_ref().map(|(k, _)| k.clone());
             let est_size = crate::wal::estimate_full_job_size_raw(
                 &tube_name,
-                body.len(),
                 &idp_key_str,
                 &group,
                 &after_group,
@@ -1355,9 +1362,7 @@ impl ServerState {
             StateChangeReason::None,
         );
 
-        if let Some(job) = self.remove_job(id) {
-            self.release_external_body(&job);
-        }
+        self.delete_job(id);
 
         // Check if any group completed and promote waiting after-jobs
         if let Some(ref grp) = group_name {
@@ -1489,12 +1494,20 @@ impl ServerState {
             }
         }
 
-        // WAL: write delete for each job, then remove from jobs map
+        // WAL: write delete for each job, then drop them from the in-memory
+        // map. Body releases are batched into a single BodyStore call so
+        // flush-tube doesn't acquire/release the BodyStore mutex per job.
+        let mut external_bodies: Vec<BodyId> = Vec::new();
         for &id in &job_ids {
             self.wal_write_state_change(id, None, 0, Duration::ZERO, 0, StateChangeReason::None);
-            if let Some(job) = self.remove_job(id) {
-                self.release_external_body(&job);
+            if let Some(job) = self.take_job(id)
+                && let BodyRef::External(body_id) = job.body
+            {
+                external_bodies.push(body_id);
             }
+        }
+        if let Some(bs) = self.body_store.as_ref() {
+            bs.delete_many(&external_bodies);
         }
 
         // Check if any affected groups completed
@@ -1696,10 +1709,7 @@ impl ServerState {
 
     fn cmd_peek(&self, id: u64) -> Response {
         match self.jobs.get(&id) {
-            Some(job) => match self.fetch_body(job) {
-                Some(body) => Response::Found { id, body },
-                None => Response::InternalError,
-            },
+            Some(job) => self.found_or_error(job),
             None => Response::NotFound,
         }
     }
@@ -1714,10 +1724,7 @@ impl ServerState {
             && let Some(&(_, job_id)) = tube.ready.peek()
             && let Some(job) = self.jobs.get(&job_id)
         {
-            return match self.fetch_body(job) {
-                Some(body) => Response::Found { id: job_id, body },
-                None => Response::InternalError,
-            };
+            return self.found_or_error(job);
         }
         Response::NotFound
     }
@@ -1732,10 +1739,7 @@ impl ServerState {
             && let Some(&(_, job_id)) = tube.delay.peek()
             && let Some(job) = self.jobs.get(&job_id)
         {
-            return match self.fetch_body(job) {
-                Some(body) => Response::Found { id: job_id, body },
-                None => Response::InternalError,
-            };
+            return self.found_or_error(job);
         }
         Response::NotFound
     }
@@ -1750,10 +1754,7 @@ impl ServerState {
             && let Some(&job_id) = tube.buried.front()
             && let Some(job) = self.jobs.get(&job_id)
         {
-            return match self.fetch_body(job) {
-                Some(body) => Response::Found { id: job_id, body },
-                None => Response::InternalError,
-            };
+            return self.found_or_error(job);
         }
         Response::NotFound
     }
@@ -1770,13 +1771,7 @@ impl ServerState {
             .filter(|j| j.state == JobState::Reserved && j.tube_name == tube_name)
             .min_by_key(|j| j.id);
         match found {
-            Some(job) => {
-                let id = job.id;
-                match self.fetch_body(job) {
-                    Some(body) => Response::Found { id, body },
-                    None => Response::InternalError,
-                }
-            }
+            Some(job) => self.found_or_error(job),
             None => Response::NotFound,
         }
     }
@@ -2718,7 +2713,7 @@ impl ServerState {
         // Temporarily take the job out to satisfy the borrow checker while
         // calling into the WAL. Accounting is net-zero across the pair because
         // `wal.write_put` does not change `job.body`, only bookkeeping fields.
-        if let Some(mut job) = self.remove_job(job_id) {
+        if let Some(mut job) = self.take_job(job_id) {
             if let Some(wal) = self.wal.as_mut()
                 && let Err(e) = wal.write_put(&mut job)
             {
@@ -2741,7 +2736,7 @@ impl ServerState {
         if self.wal.is_none() {
             return;
         }
-        if let Some(mut job) = self.remove_job(job_id) {
+        if let Some(mut job) = self.take_job(job_id) {
             if let Some(wal) = self.wal.as_mut()
                 && let Err(e) =
                     wal.write_state_change(&mut job, state, pri, delay, expiry_epoch_secs, reason)
@@ -2805,11 +2800,10 @@ fn build_state(
         // existing operators upgrading without TOAST data will see an
         // empty index, which is correct.
         let toast_dir = dir.join("toast");
-        let body_store = Arc::new(
-            BodyStore::open(&toast_dir, crate::body_store::DEFAULT_SEGMENT_SIZE).map_err(
-                |e| io::Error::other(format!("opening body store at {:?}: {}", toast_dir, e)),
-            )?,
-        );
+        let body_store = Arc::new(BodyStore::open(
+            &toast_dir,
+            crate::body_store::DEFAULT_SEGMENT_SIZE,
+        )?);
 
         let mut wal = Wal::open(
             dir,
@@ -2821,43 +2815,36 @@ fn build_state(
         let on_disk = wal.total_disk_bytes();
 
         tracing::info!("WAL: replaying {} bytes from {:?}", on_disk, dir);
-        let (mut jobs, next_id, tombstones) = wal.replay()?;
+        let (mut jobs, next_id, tombstones, orphan_bodies) = wal.replay()?;
         let job_count = jobs.len();
         let tombstone_count = tombstones.len();
 
+        // Reclaim TOAST bodies whose owning job was deleted but whose
+        // pre-WAL-fsync `BodyStore::delete` never landed (server crashed
+        // between WAL fsync and TOAST cleanup). Without this, orphans
+        // accumulate on disk indefinitely.
+        if !orphan_bodies.is_empty() {
+            body_store.delete_many(&orphan_bodies);
+            tracing::info!(
+                "WAL replay: reclaimed {} orphan TOAST bodies",
+                orphan_bodies.len()
+            );
+        }
+
         // Migrate inline bodies recovered from pre-v5 WAL records into the
-        // body store. The result is a uniform External world for all
-        // subsequent code paths (read, write, accounting, serialize). v5
-        // records already arrive as External — they're left alone.
+        // body store. v5 records already arrive as External — left alone.
         let mut migrated = 0u64;
         for job in jobs.values_mut() {
-            let job_id = job.id;
-            // Use a sentinel Inline(empty) while we move the original body
-            // out to satisfy the borrow checker. The match below restores
-            // the field in every branch.
-            let original = std::mem::replace(&mut job.body, BodyRef::Inline(Vec::new()));
-            match original {
-                BodyRef::Inline(bytes) => {
-                    let body_id = body_store.write_body(&bytes).map_err(|e| {
-                        io::Error::other(format!(
-                            "WAL→TOAST migration failed for job {}: {}",
-                            job_id, e
-                        ))
-                    })?;
-                    job.body = BodyRef::External(body_id);
-                    migrated += 1;
-                }
-                external @ BodyRef::External(_) => {
-                    job.body = external;
-                }
+            if let Some(bytes) = job.body.take_inline() {
+                let body_id = body_store.write_body(&bytes)?;
+                job.body = BodyRef::External(body_id);
+                migrated += 1;
             }
         }
         if migrated > 0 {
             // Force the body store to disk before the WAL replay completes
             // — bodies must outlive their referencing FullJob records.
-            body_store
-                .fsync()
-                .map_err(|e| io::Error::other(format!("body store fsync after migration: {}", e)))?;
+            body_store.fsync()?;
             tracing::info!("WAL→TOAST: migrated {} inline bodies into the body store", migrated);
         }
 

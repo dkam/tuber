@@ -3,7 +3,7 @@
 // When enabled via `-b <dir>`, all job mutations are logged to append-only files.
 // On restart, the WAL is replayed to restore state.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::body_store::BodyStore;
-use crate::job::{BodyRef, Job, JobState};
+use crate::job::{BodyId, BodyRef, Job, JobState};
 
 // --- Constants ---
 
@@ -306,12 +306,8 @@ pub fn estimate_full_job_size(job: &Job) -> usize {
 }
 
 /// Estimate full job record size without needing a Job struct.
-///
-/// `_body_len` is accepted for API stability but ignored: v5 records carry
-/// an 8-byte body id, not the body bytes themselves.
 pub fn estimate_full_job_size_raw(
     tube_name: &str,
-    _body_len: usize,
     idempotency_key: &Option<String>,
     group: &Option<String>,
     after_group: &Option<String>,
@@ -759,8 +755,7 @@ impl Wal {
     /// wasted space) rather than dangling references.
     fn pre_sync_body_store(&self) -> io::Result<()> {
         if let Some(bs) = &self.body_store {
-            bs.fsync()
-                .map_err(|e| io::Error::other(format!("body store fsync: {}", e)))?;
+            bs.fsync()?;
         }
         Ok(())
     }
@@ -1046,10 +1041,18 @@ impl Wal {
 
     // --- Replay ---
 
-    pub fn replay(&mut self) -> io::Result<(HashMap<u64, Job>, u64, Vec<IdpTombstone>)> {
+    pub fn replay(
+        &mut self,
+    ) -> io::Result<(HashMap<u64, Job>, u64, Vec<IdpTombstone>, Vec<BodyId>)> {
         let mut jobs: HashMap<u64, Job> = HashMap::new();
         let mut max_id: u64 = 0;
         let mut tombstones: Vec<IdpTombstone> = Vec::new();
+        // Bodies referenced by jobs that the WAL says are deleted. The
+        // runtime delete path calls `BodyStore::delete` after the WAL
+        // delete record lands, but a crash between the two leaves the
+        // body orphaned in TOAST. Replay collects those ids so the
+        // caller can drop them after rebuilding state.
+        let mut orphan_bodies: Vec<BodyId> = Vec::new();
         let replay_time = SystemTime::now();
 
         // Read and process each file
@@ -1135,10 +1138,13 @@ impl Wal {
                                                 }
                                             }
                                         }
-                                        if let Some(old_job) = jobs.remove(&job_id)
-                                            && let Some(old_seq) = old_job.wal_file_seq
-                                        {
-                                            self.decref_file(old_seq, old_job.wal_used);
+                                        if let Some(old_job) = jobs.remove(&job_id) {
+                                            if let Some(old_seq) = old_job.wal_file_seq {
+                                                self.decref_file(old_seq, old_job.wal_used);
+                                            }
+                                            if let BodyRef::External(body_id) = old_job.body {
+                                                orphan_bodies.push(body_id);
+                                            }
                                         }
                                     }
                                     Some(state) => {
@@ -1204,7 +1210,19 @@ impl Wal {
         // Create new writable file
         self.create_next_file()?;
 
-        Ok((jobs, max_id + 1, tombstones))
+        // Filter orphans against the final job set: a job may have been
+        // recreated under the same id within the same WAL, in which case
+        // the "orphan" is now live again and must not be deleted.
+        let live_body_ids: HashSet<BodyId> = jobs
+            .values()
+            .filter_map(|j| match &j.body {
+                BodyRef::External(id) => Some(*id),
+                BodyRef::Inline(_) => None,
+            })
+            .collect();
+        orphan_bodies.retain(|id| !live_body_ids.contains(id));
+
+        Ok((jobs, max_id + 1, tombstones, orphan_bodies))
     }
 
     // --- GC and compaction ---
@@ -1235,8 +1253,8 @@ impl Wal {
         // requires self, but the file mut borrow below blocks that.
         let will_sync =
             !self.sync_interval.is_zero() && self.last_sync_at.elapsed() >= self.sync_interval;
-        if will_sync {
-            let _ = self.pre_sync_body_store();
+        if will_sync && let Err(e) = self.pre_sync_body_store() {
+            tracing::warn!("WAL maintain: TOAST fsync failed: {}", e);
         }
 
         if let Some(f) = self.files.back_mut()
@@ -1256,7 +1274,9 @@ impl Wal {
     /// Used on shutdown to guarantee the buffered tail reaches disk regardless
     /// of the configured sync interval.
     pub fn flush_and_sync(&mut self) {
-        let _ = self.pre_sync_body_store();
+        if let Err(e) = self.pre_sync_body_store() {
+            tracing::warn!("WAL flush_and_sync: TOAST fsync failed: {}", e);
+        }
         if let Some(f) = self.files.back_mut()
             && let Some(fd) = f.fd.as_mut()
         {
@@ -1635,7 +1655,7 @@ mod tests {
 
         // Replay should recover both valid jobs, skip the garbage
         let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-        let (jobs, next_id, _) = wal.replay().unwrap();
+        let (jobs, next_id, _, _) = wal.replay().unwrap();
         assert_eq!(jobs.len(), 2);
         assert!(jobs.contains_key(&1));
         assert!(jobs.contains_key(&2));
@@ -1676,7 +1696,7 @@ mod tests {
 
         // Replay should skip the bad file, recover nothing
         let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-        let (jobs, _, _) = wal.replay().unwrap();
+        let (jobs, _, _, _) = wal.replay().unwrap();
         assert!(jobs.is_empty());
     }
 
@@ -1725,7 +1745,7 @@ mod tests {
 
         // Should recover job 1 only
         let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-        let (jobs, next_id, _) = wal.replay().unwrap();
+        let (jobs, next_id, _, _) = wal.replay().unwrap();
         assert_eq!(jobs.len(), 1);
         assert!(jobs.contains_key(&1));
         assert!(next_id >= 2);
@@ -1868,7 +1888,7 @@ mod tests {
         // Replay
         {
             let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-            let (jobs, next_id, _) = wal.replay().unwrap();
+            let (jobs, next_id, _, _) = wal.replay().unwrap();
 
             // Job 1 was deleted
             assert!(!jobs.contains_key(&1));
@@ -2160,7 +2180,7 @@ mod tests {
         // Reopen and replay — job must survive
         {
             let mut wal = Wal::open(dir.path(), WalConfig::with_max_file_size(64)).unwrap();
-            let (jobs, _next_id, _tombstones) = wal.replay().unwrap();
+            let (jobs, _next_id, _tombstones, _orphans) = wal.replay().unwrap();
 
             assert!(jobs.contains_key(&1), "job 1 must survive replay after GC");
             let job = jobs.get(&1).unwrap();
@@ -2356,7 +2376,7 @@ mod tests {
         // Replay and verify all counters
         {
             let mut wal = Wal::open(dir_path, WalConfig::with_max_file_size(1024 * 1024)).unwrap();
-            let (jobs, _, _) = wal.replay().unwrap();
+            let (jobs, _, _, _) = wal.replay().unwrap();
 
             let job = jobs.get(&1).expect("job 1 should exist after replay");
             assert_eq!(job.state, JobState::Buried);
@@ -2536,7 +2556,7 @@ mod tests {
             config_with_interval(1024 * 1024, Duration::from_secs(3600)),
         )
         .unwrap();
-        let (jobs, _, _) = wal.replay().unwrap();
+        let (jobs, _, _, _) = wal.replay().unwrap();
         assert!(jobs.contains_key(&1), "job should survive buffered replay");
         assert!(matches!(&jobs[&1].body, BodyRef::External(_)));
     }
@@ -2571,7 +2591,86 @@ mod tests {
             config_with_interval(1024 * 1024, Duration::from_secs(3600)),
         )
         .unwrap();
-        let (jobs, _, _) = wal.replay().unwrap();
+        let (jobs, _, _, _) = wal.replay().unwrap();
         assert!(jobs.contains_key(&1));
+    }
+
+    /// A job that's `put` and then `delete`d in the same WAL must surface
+    /// its `BodyId` in the orphan list returned from `replay`. Without
+    /// this, a server that crashes between WAL fsync and the runtime
+    /// `BodyStore::delete` call leaks the body on disk forever.
+    #[test]
+    fn test_replay_returns_orphan_body_ids_for_deleted_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut wal = Wal::open(dir.path(), config_with_interval(1024 * 1024, Duration::from_secs(3600))).unwrap();
+            let mut job = Job::new(
+                42,
+                100,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                b"orphan-me".to_vec(),
+                "default".to_string(),
+            );
+            external_body(&mut job);
+            wal.write_put(&mut job).unwrap();
+            wal.write_state_change(
+                &mut job,
+                None,
+                0,
+                Duration::ZERO,
+                0,
+                StateChangeReason::None,
+            )
+            .unwrap();
+            wal.flush_and_sync();
+        }
+
+        let mut wal = Wal::open(dir.path(), config_with_interval(1024 * 1024, Duration::from_secs(3600))).unwrap();
+        let (jobs, _, _, orphans) = wal.replay().unwrap();
+        assert!(jobs.is_empty(), "deleted job must not survive replay");
+        assert_eq!(orphans, vec![BodyId(42)]);
+    }
+
+    /// A job that's deleted and then re-put under the same id within the
+    /// same WAL must NOT appear as an orphan — its body is live.
+    #[test]
+    fn test_replay_orphan_filter_keeps_recreated_jobs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let mut wal = Wal::open(dir.path(), config_with_interval(1024 * 1024, Duration::from_secs(3600))).unwrap();
+            let mut job = Job::new(
+                7,
+                100,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                b"v1".to_vec(),
+                "default".to_string(),
+            );
+            external_body(&mut job);
+            wal.write_put(&mut job).unwrap();
+            wal.write_state_change(
+                &mut job,
+                None,
+                0,
+                Duration::ZERO,
+                0,
+                StateChangeReason::None,
+            )
+            .unwrap();
+            // Re-put job id 7 with the same BodyId (deterministic id == job.id).
+            external_body(&mut job);
+            wal.write_put(&mut job).unwrap();
+            wal.flush_and_sync();
+        }
+
+        let mut wal = Wal::open(dir.path(), config_with_interval(1024 * 1024, Duration::from_secs(3600))).unwrap();
+        let (jobs, _, _, orphans) = wal.replay().unwrap();
+        assert!(jobs.contains_key(&7), "re-put job must survive replay");
+        assert!(
+            orphans.is_empty(),
+            "live body must not be reported as orphan: {:?}",
+            orphans
+        );
     }
 }
