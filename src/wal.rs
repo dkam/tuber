@@ -7,16 +7,24 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::job::{Job, JobState};
-#[cfg(test)]
-use crate::job::BodyRef;
+use crate::body_store::BodyStore;
+use crate::job::{BodyRef, Job, JobState};
 
 // --- Constants ---
 
 const WAL_MAGIC: &[u8; 4] = b"TWAL";
-const WAL_VERSION: u32 = 4;
+/// Current WAL format version.
+///
+/// - v3: original format.
+/// - v4: state-change records gained a `reason` byte.
+/// - v5: `FullJob` records carry a `BodyId` instead of inline body bytes.
+///       Bodies live in the external body store ("TOAST"). Older versions
+///       are still readable; their inline bodies are migrated into the body
+///       store on replay.
+const WAL_VERSION: u32 = 5;
 const WAL_VERSION_MIN: u32 = 3; // Oldest version we can still read
 const HEADER_SIZE: usize = 12; // magic(4) + version(4) + flags(4)
 const RECORD_TYPE_FULL_JOB: u8 = 0x01;
@@ -226,10 +234,17 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
             .to_le_bytes(),
     );
 
-    // body (last — largest variable-length field)
-    let body_bytes = job.body_bytes();
-    payload.extend_from_slice(&(body_bytes.len() as u32).to_le_bytes());
-    payload.extend_from_slice(body_bytes);
+    // body — v5 carries a BodyId reference into the external body store.
+    // Inline bodies must not reach this path; the put / replay-migration
+    // hooks switch every Job to BodyRef::External before serialization.
+    let body_id = match &job.body {
+        BodyRef::External(id) => id.0,
+        BodyRef::Inline(_) => unreachable!(
+            "WAL v5 serialization received an Inline body — \
+             the body store integration must run before write_put"
+        ),
+    };
+    payload.extend_from_slice(&body_id.to_le_bytes());
 
     // Build full record: type + job_id + payload_len + payload + crc
     let mut record = Vec::with_capacity(1 + 8 + 4 + payload.len() + 4);
@@ -275,13 +290,14 @@ pub fn serialize_state_change(
 }
 
 pub fn estimate_full_job_size(job: &Job) -> usize {
-    // type(1) + job_id(8) + payload_len(4) + crc(4) = 17 overhead
-    // payload: pri(4) + delay(8) + ttr(8) + epoch(8) + state(1) +
-    //          5 counters * 4 = 20 + tube_name_len(2) + tube_name +
-    //          body_len(4) + body + 4 option_strings (2 bytes each min) + concurrency_limit(4) + idp_ttl(4)
-    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 4 + 8 + 4 + 4; // +4 concurrency limit +4 idp ttl
+    // v5 layout:
+    //   type(1) + job_id(8) + payload_len(4) + crc(4) = 17 overhead
+    //   payload: pri(4) + delay(8) + ttr(8) + epoch(8) + state(1)
+    //          + 5 counters * 4 = 20 + tube_name_len(2) + tube_name
+    //          + 4 option_strings (2 bytes each min) + concurrency_limit(4)
+    //          + idp_ttl(4) + body_id(8)
+    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 8 + 8 + 4 + 4;
     let variable = job.tube_name.len()
-        + job.body_size()
         + job.idempotency_key.as_ref().map_or(0, |(s, _)| s.len())
         + job.group.as_ref().map_or(0, |s| s.len())
         + job.after_group.as_ref().map_or(0, |s| s.len())
@@ -290,21 +306,20 @@ pub fn estimate_full_job_size(job: &Job) -> usize {
 }
 
 /// Estimate full job record size without needing a Job struct.
+///
+/// `_body_len` is accepted for API stability but ignored: v5 records carry
+/// an 8-byte body id, not the body bytes themselves.
 pub fn estimate_full_job_size_raw(
     tube_name: &str,
-    body_len: usize,
+    _body_len: usize,
     idempotency_key: &Option<String>,
     group: &Option<String>,
     after_group: &Option<String>,
     concurrency_key: &Option<(String, u32)>,
 ) -> usize {
-    // type(1) + job_id(8) + payload_len(4) + crc(4) = 17 overhead
-    // payload: pri(4) + delay(8) + ttr(8) + epoch(8) + state(1) +
-    //          5 counters * 4 = 20 + tube_name_len(2) + tube_name +
-    //          body_len(4) + body + 4 option_strings (2 bytes each min) + concurrency_limit(4) + idp_ttl(4)
-    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 4 + 8 + 4 + 4;
+    // v5 layout — see [`estimate_full_job_size`] for field-by-field accounting.
+    let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 8 + 8 + 4 + 4;
     let variable = tube_name.len()
-        + body_len
         + idempotency_key.as_ref().map_or(0, |s| s.len())
         + group.as_ref().map_or(0, |s| s.len())
         + after_group.as_ref().map_or(0, |s| s.len())
@@ -315,20 +330,20 @@ pub fn estimate_full_job_size_raw(
 // --- Deserialization ---
 
 /// Deserialize a single record from `data`. Returns (record, bytes_consumed).
-pub fn deserialize_record(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
+pub fn deserialize_record(data: &[u8], version: u32) -> Result<(WalRecord, usize), WalError> {
     if data.is_empty() {
         return Err(WalError::Truncated);
     }
 
     let record_type = data[0];
     match record_type {
-        RECORD_TYPE_FULL_JOB => deserialize_full_job(data),
+        RECORD_TYPE_FULL_JOB => deserialize_full_job(data, version),
         RECORD_TYPE_STATE_CHANGE => deserialize_state_change(data),
         _ => Err(WalError::UnknownRecordType(record_type)),
     }
 }
 
-fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
+fn deserialize_full_job(data: &[u8], version: u32) -> Result<(WalRecord, usize), WalError> {
     // type(1) + job_id(8) + payload_len(4) = 13 byte header minimum
     if data.len() < 13 {
         return Err(WalError::Truncated);
@@ -442,13 +457,21 @@ fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
     let concurrency_limit = read_u32!();
     let concurrency_key = concurrency_key_str.map(|k| (k, concurrency_limit.max(1)));
 
-    // body (last — largest variable-length field)
-    let body_len = read_u32!() as usize;
-    if off + body_len > payload.len() {
-        return Err(WalError::Truncated);
-    }
-    let body = payload[off..off + body_len].to_vec();
-    off += body_len;
+    // body — v5 records reference a BodyId in the external body store;
+    // older records carry inline bytes that the replay-migration step will
+    // promote into the body store after the fact.
+    let body_ref = if version >= 5 {
+        let body_id = read_u64!();
+        BodyRef::External(crate::job::BodyId(body_id))
+    } else {
+        let body_len = read_u32!() as usize;
+        if off + body_len > payload.len() {
+            return Err(WalError::Truncated);
+        }
+        let body = payload[off..off + body_len].to_vec();
+        off += body_len;
+        BodyRef::Inline(body)
+    };
     let _ = off;
 
     let delay = Duration::from_nanos(delay_nanos);
@@ -462,7 +485,11 @@ fn deserialize_full_job(data: &[u8]) -> Result<(WalRecord, usize), WalError> {
         _ => (state, None),
     };
 
-    let mut job = Job::new(job_id, priority, Duration::ZERO, ttr, body, tube_name);
+    // Construct the Job with an empty inline body, then overwrite with the
+    // version-specific BodyRef. This keeps `Job::new`'s public signature
+    // stable while supporting both v5 (External) and pre-v5 (Inline) replay.
+    let mut job = Job::new(job_id, priority, Duration::ZERO, ttr, Vec::new(), tube_name);
+    job.body = body_ref;
     job.delay = delay;
     job.state = replay_state;
     job.deadline_at = deadline_at;
@@ -548,7 +575,9 @@ fn write_header(w: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-fn read_header(data: &[u8]) -> Result<u32, WalError> {
+/// Returns `(version, flags)` from a WAL file header. Validates that the
+/// version is within the supported range.
+fn read_header(data: &[u8]) -> Result<(u32, u32), WalError> {
     if data.len() < HEADER_SIZE {
         return Err(WalError::Truncated);
     }
@@ -560,7 +589,7 @@ fn read_header(data: &[u8]) -> Result<u32, WalError> {
         return Err(WalError::BadVersion(version));
     }
     let flags = u32::from_le_bytes(data[8..12].try_into().map_err(|_| WalError::Truncated)?);
-    Ok(flags)
+    Ok((version, flags))
 }
 
 // --- WAL file management ---
@@ -613,6 +642,10 @@ pub struct Wal {
     reserved_bytes: u64,
     alive_bytes: u64,
     records_migrated: u64,
+    /// External body store. When present, every WAL fsync is preceded by a
+    /// body-store fsync so that any `BodyId` referenced by an acked WAL
+    /// record is already durable on disk.
+    body_store: Option<Arc<BodyStore>>,
     #[allow(dead_code)] // held for flock side effect
     lock_fd: Option<File>,
     #[cfg(test)]
@@ -697,6 +730,7 @@ impl Wal {
             reserved_bytes: 0,
             alive_bytes: 0,
             records_migrated: 0,
+            body_store: None,
             lock_fd: Some(lock_fd),
             #[cfg(test)]
             sync_count: 0,
@@ -710,6 +744,25 @@ impl Wal {
     /// Returns the configured fsync interval. `Duration::ZERO` means per-write.
     pub fn sync_interval(&self) -> Duration {
         self.sync_interval
+    }
+
+    /// Attach a body store whose fsync must complete before any WAL fsync.
+    /// Called once at startup, after the body store has been opened and
+    /// before any WAL writes.
+    pub fn set_body_store(&mut self, bs: Arc<BodyStore>) {
+        self.body_store = Some(bs);
+    }
+
+    /// fsync the body store (if attached) so referenced bodies are durable
+    /// before we promise the same of any WAL record. The TOAST-then-WAL
+    /// order means a crash mid-sync produces orphan bodies (recoverable as
+    /// wasted space) rather than dangling references.
+    fn pre_sync_body_store(&self) -> io::Result<()> {
+        if let Some(bs) = &self.body_store {
+            bs.fsync()
+                .map_err(|e| io::Error::other(format!("body store fsync: {}", e)))?;
+        }
+        Ok(())
     }
 
     fn acquire_lock(dir: &Path) -> io::Result<File> {
@@ -830,7 +883,9 @@ impl Wal {
 
     fn rotate_if_needed(&mut self) -> io::Result<()> {
         if self.should_rotate() {
-            // Close current file
+            // Close current file. Sync TOAST first so any BodyId references
+            // about to land in the WAL are already durable.
+            self.pre_sync_body_store()?;
             if let Some(f) = self.files.back_mut()
                 && let Some(mut fd) = f.fd.take()
             {
@@ -860,6 +915,9 @@ impl Wal {
         let record_len = record.len();
 
         let sync_per_write = self.sync_interval.is_zero();
+        if sync_per_write {
+            self.pre_sync_body_store()?;
+        }
         let file = self.current_file_mut()?;
         let fd = file
             .fd
@@ -925,6 +983,9 @@ impl Wal {
         let record_len = record.len();
 
         let sync_per_write = self.sync_interval.is_zero();
+        if sync_per_write {
+            self.pre_sync_body_store()?;
+        }
         let file = self.current_file_mut()?;
         let fd = file
             .fd
@@ -1011,15 +1072,17 @@ impl Wal {
                 }
             };
 
-            if let Err(e) = read_header(&data) {
-                tracing::warn!("WAL: bad header in {:?}: {}", path, e);
-                continue;
-            }
-            // flags field read but currently unused (reserved for future features)
+            let version = match read_header(&data) {
+                Ok((v, _flags)) => v,
+                Err(e) => {
+                    tracing::warn!("WAL: bad header in {:?}: {}", path, e);
+                    continue;
+                }
+            };
 
             let mut offset = HEADER_SIZE;
             while offset < data.len() {
-                match deserialize_record(&data[offset..]) {
+                match deserialize_record(&data[offset..], version) {
                     Ok((record, consumed)) => {
                         match record {
                             WalRecord::FullJob(mut job) => {
@@ -1168,13 +1231,21 @@ impl Wal {
     pub fn maintain(&mut self) {
         self.gc();
 
+        // Decide up front whether we'll fsync this tick — pre-syncing TOAST
+        // requires self, but the file mut borrow below blocks that.
+        let will_sync =
+            !self.sync_interval.is_zero() && self.last_sync_at.elapsed() >= self.sync_interval;
+        if will_sync {
+            let _ = self.pre_sync_body_store();
+        }
+
         if let Some(f) = self.files.back_mut()
             && let Some(fd) = f.fd.as_mut()
         {
             let _ = fd.flush();
 
             // Skip interval sync when interval=0 — writes already synced inline.
-            if !self.sync_interval.is_zero() && self.last_sync_at.elapsed() >= self.sync_interval {
+            if will_sync {
                 let _ = fd.get_ref().sync_all();
                 self.record_sync();
             }
@@ -1185,6 +1256,7 @@ impl Wal {
     /// Used on shutdown to guarantee the buffered tail reaches disk regardless
     /// of the configured sync interval.
     pub fn flush_and_sync(&mut self) {
+        let _ = self.pre_sync_body_store();
         if let Some(f) = self.files.back_mut()
             && let Some(fd) = f.fd.as_mut()
         {
@@ -1205,14 +1277,23 @@ impl Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::BodyId;
 
-    fn make_test_job(id: u64, body: &[u8]) -> Job {
+    /// Switch a test-built job to a synthetic external `BodyRef`. The WAL's
+    /// v5 serializer requires `BodyRef::External`; unit tests don't run a
+    /// body store, so we fabricate a deterministic id (the job's own id)
+    /// and assert on it where roundtripping matters.
+    fn external_body(job: &mut Job) {
+        job.body = BodyRef::External(BodyId(job.id));
+    }
+
+    fn make_test_job(id: u64, _body: &[u8]) -> Job {
         let mut job = Job::new(
             id,
             100,
             Duration::from_secs(5),
             Duration::from_secs(30),
-            body.to_vec(),
+            Vec::new(),
             "test-tube".to_string(),
         );
         job.reserve_ct = 3;
@@ -1224,6 +1305,7 @@ mod tests {
         job.group = Some("group1".to_string());
         job.after_group = None;
         job.concurrency_key = Some(("conc".to_string(), 3));
+        external_body(&mut job);
         job
     }
 
@@ -1231,7 +1313,7 @@ mod tests {
     fn test_serialize_deserialize_full_job() {
         let job = make_test_job(42, b"hello world");
         let record = serialize_full_job(&job);
-        let (rec, consumed) = deserialize_record(&record).unwrap();
+        let (rec, consumed) = deserialize_record(&record, WAL_VERSION).unwrap();
         assert_eq!(consumed, record.len());
 
         if let WalRecord::FullJob(j) = rec {
@@ -1239,7 +1321,7 @@ mod tests {
             assert_eq!(j.priority, 100);
             assert_eq!(j.delay, Duration::from_secs(5));
             assert_eq!(j.ttr, Duration::from_secs(30));
-            assert_eq!(j.body_bytes(), b"hello world");
+            assert!(matches!(&j.body, BodyRef::External(_)));
             assert_eq!(j.tube_name, "test-tube");
             assert_eq!(j.reserve_ct, 3);
             assert_eq!(j.timeout_ct, 1);
@@ -1252,8 +1334,8 @@ mod tests {
             assert_eq!(j.concurrency_key, Some(("conc".to_string(), 3)));
             // Reserved replays as Ready
             assert_eq!(j.state, JobState::Delayed); // original was delayed (delay > 0)
-            // Body must round-trip as Inline — Phase 2 invariant.
-            assert!(matches!(j.body, BodyRef::Inline(_)));
+            // v5 round-trip preserves the BodyId reference, not the bytes.
+            assert!(matches!(j.body, BodyRef::External(BodyId(42))));
         } else {
             panic!("expected FullJob");
         }
@@ -1271,7 +1353,7 @@ mod tests {
         );
         assert_eq!(record.len(), STATE_CHANGE_RECORD_SIZE);
 
-        let (rec, consumed) = deserialize_record(&record).unwrap();
+        let (rec, consumed) = deserialize_record(&record, WAL_VERSION).unwrap();
         assert_eq!(consumed, STATE_CHANGE_RECORD_SIZE);
 
         if let WalRecord::StateChange {
@@ -1297,7 +1379,7 @@ mod tests {
     #[test]
     fn test_serialize_deserialize_state_change_deleted() {
         let record = serialize_state_change(77, None, 0, 0, 0, StateChangeReason::None);
-        let (rec, _) = deserialize_record(&record).unwrap();
+        let (rec, _) = deserialize_record(&record, WAL_VERSION).unwrap();
 
         if let WalRecord::StateChange { new_state, .. } = rec {
             assert!(new_state.is_none());
@@ -1312,7 +1394,7 @@ mod tests {
             serialize_state_change(99, Some(JobState::Ready), 0, 0, 0, StateChangeReason::None);
         // Corrupt a byte in the middle
         record[5] ^= 0xFF;
-        let result = deserialize_record(&record);
+        let result = deserialize_record(&record, WAL_VERSION);
         assert!(matches!(result, Err(WalError::BadCrc)));
     }
 
@@ -1384,7 +1466,7 @@ mod tests {
         // Only 5 bytes — not enough for the 13-byte header
         let data = vec![RECORD_TYPE_FULL_JOB, 1, 2, 3, 4];
         assert!(matches!(
-            deserialize_record(&data),
+            deserialize_record(&data, WAL_VERSION),
             Err(WalError::Truncated)
         ));
     }
@@ -1397,7 +1479,7 @@ mod tests {
         data.extend_from_slice(&1000u32.to_le_bytes()); // payload_len = 1000
         // Only 13 bytes total, nowhere near 1000 + 4 CRC
         assert!(matches!(
-            deserialize_record(&data),
+            deserialize_record(&data, WAL_VERSION),
             Err(WalError::Truncated)
         ));
     }
@@ -1409,7 +1491,7 @@ mod tests {
         // Corrupt the last byte (CRC)
         let len = record.len();
         record[len - 1] ^= 0xFF;
-        assert!(matches!(deserialize_record(&record), Err(WalError::BadCrc)));
+        assert!(matches!(deserialize_record(&record, WAL_VERSION), Err(WalError::BadCrc)));
     }
 
     #[test]
@@ -1418,7 +1500,7 @@ mod tests {
         let mut record = serialize_full_job(&job);
         // Corrupt a payload byte (not the CRC itself)
         record[20] ^= 0xFF;
-        assert!(matches!(deserialize_record(&record), Err(WalError::BadCrc)));
+        assert!(matches!(deserialize_record(&record, WAL_VERSION), Err(WalError::BadCrc)));
     }
 
     #[test]
@@ -1426,7 +1508,7 @@ mod tests {
         // Too short for STATE_CHANGE_RECORD_SIZE
         let data = vec![RECORD_TYPE_STATE_CHANGE, 0, 0, 0];
         assert!(matches!(
-            deserialize_record(&data),
+            deserialize_record(&data, WAL_VERSION),
             Err(WalError::Truncated)
         ));
     }
@@ -1437,7 +1519,7 @@ mod tests {
             serialize_state_change(1, Some(JobState::Ready), 100, 0, 0, StateChangeReason::None);
         let len = record.len();
         record[len - 2] ^= 0xFF;
-        assert!(matches!(deserialize_record(&record), Err(WalError::BadCrc)));
+        assert!(matches!(deserialize_record(&record, WAL_VERSION), Err(WalError::BadCrc)));
     }
 
     #[test]
@@ -1453,7 +1535,7 @@ mod tests {
         let crc = crc32fast::hash(&record[..crc_offset]);
         record[crc_offset..].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(
-            deserialize_record(&record),
+            deserialize_record(&record, WAL_VERSION),
             Err(WalError::InvalidData)
         ));
     }
@@ -1469,7 +1551,7 @@ mod tests {
         let crc = crc32fast::hash(&record[..crc_offset]);
         record[crc_offset..].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(
-            deserialize_record(&record),
+            deserialize_record(&record, WAL_VERSION),
             Err(WalError::InvalidData)
         ));
     }
@@ -1478,14 +1560,14 @@ mod tests {
     fn test_unknown_record_type() {
         let data = vec![0xFF; STATE_CHANGE_RECORD_SIZE];
         assert!(matches!(
-            deserialize_record(&data),
+            deserialize_record(&data, WAL_VERSION),
             Err(WalError::UnknownRecordType(0xFF))
         ));
     }
 
     #[test]
     fn test_empty_data() {
-        assert!(matches!(deserialize_record(&[]), Err(WalError::Truncated)));
+        assert!(matches!(deserialize_record(&[], WAL_VERSION), Err(WalError::Truncated)));
     }
 
     #[test]
@@ -1522,6 +1604,7 @@ mod tests {
                 b"body1".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job1);
             wal.write_put(&mut job1).unwrap();
 
             let mut job2 = Job::new(
@@ -1532,6 +1615,7 @@ mod tests {
                 b"body2".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job2);
             wal.write_put(&mut job2).unwrap();
         }
 
@@ -1574,6 +1658,7 @@ mod tests {
                 b"body1".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job1);
             wal.write_put(&mut job1).unwrap();
         }
 
@@ -1611,6 +1696,7 @@ mod tests {
                 b"body1".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job1);
             wal.write_put(&mut job1).unwrap();
             let mut job2 = Job::new(
                 2,
@@ -1620,6 +1706,7 @@ mod tests {
                 b"body2".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job2);
             wal.write_put(&mut job2).unwrap();
         }
 
@@ -1664,6 +1751,7 @@ mod tests {
             b"body1".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job1);
         wal.write_put(&mut job1).unwrap();
 
         assert_eq!(wal.file_count(), 1);
@@ -1683,6 +1771,7 @@ mod tests {
             b"body2".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job2);
         wal.write_put(&mut job2).unwrap();
 
         assert_eq!(wal.file_count(), 1);
@@ -1708,6 +1797,7 @@ mod tests {
             b"body1".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job1);
         wal.write_put(&mut job1).unwrap();
 
         let mut job2 = Job::new(
@@ -1718,6 +1808,7 @@ mod tests {
             b"body2".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job2);
         wal.write_put(&mut job2).unwrap();
 
         assert!(
@@ -1748,6 +1839,7 @@ mod tests {
                 b"body1".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job1);
             wal.write_put(&mut job1).unwrap();
 
             let mut job2 = Job::new(
@@ -1758,6 +1850,7 @@ mod tests {
                 b"body2".to_vec(),
                 "other".to_string(),
             );
+            external_body(&mut job2);
             wal.write_put(&mut job2).unwrap();
 
             // Delete job 1
@@ -1783,7 +1876,7 @@ mod tests {
             assert!(jobs.contains_key(&2));
             let j2 = &jobs[&2];
             assert_eq!(j2.priority, 20);
-            assert_eq!(j2.body_bytes(), b"body2");
+            assert!(matches!(&j2.body, BodyRef::External(_)));
             assert_eq!(j2.tube_name, "other");
             assert_eq!(j2.state, JobState::Delayed);
             assert!(next_id >= 3);
@@ -1803,6 +1896,7 @@ mod tests {
             b"body".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job);
         wal.write_put(&mut job).unwrap();
 
         // Only one file — no compaction target
@@ -1825,6 +1919,7 @@ mod tests {
                 b"body".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job);
             wal.write_put(&mut job).unwrap();
         }
 
@@ -1854,6 +1949,7 @@ mod tests {
                 b"body".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job);
             wal.write_put(&mut job).unwrap();
             jobs.push(job);
         }
@@ -1891,6 +1987,7 @@ mod tests {
             b"body1".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job1);
         wal.write_put(&mut job1).unwrap();
 
         let mut job2 = Job::new(
@@ -1901,6 +1998,7 @@ mod tests {
             b"body2".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job2);
         wal.write_put(&mut job2).unwrap();
 
         let mut job3 = Job::new(
@@ -1911,6 +2009,7 @@ mod tests {
             b"body3".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job3);
         wal.write_put(&mut job3).unwrap();
 
         let count_before_gc = wal.file_count();
@@ -1970,6 +2069,7 @@ mod tests {
                 b"data".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job);
             wal.write_put(&mut job).unwrap();
             jobs.push(job);
         }
@@ -1999,6 +2099,7 @@ mod tests {
             let current_seq = wal.current_seq();
             if old_seq != current_seq {
                 // Re-write to current file (this is what the server does)
+                external_body(job20);
                 wal.write_put(job20).unwrap();
                 wal.record_migration();
                 wal.maintain(); // gc again
@@ -2027,6 +2128,7 @@ mod tests {
                 b"important-data".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job);
             wal.write_put(&mut job).unwrap();
 
             // State change goes to a new file due to small max_file_size
@@ -2063,7 +2165,7 @@ mod tests {
             assert!(jobs.contains_key(&1), "job 1 must survive replay after GC");
             let job = jobs.get(&1).unwrap();
             assert_eq!(job.state, JobState::Buried);
-            assert_eq!(job.body_bytes(), b"important-data");
+            assert!(matches!(&job.body, BodyRef::External(_)));
         }
     }
 
@@ -2082,11 +2184,13 @@ mod tests {
         );
 
         // Initial put — should add one reservation
+        external_body(&mut job);
         wal.write_put(&mut job).unwrap();
         let after_put = wal.reserved_bytes;
         assert_eq!(after_put, STATE_CHANGE_RECORD_SIZE as u64);
 
         // Simulate compaction migration — should NOT add another reservation
+        external_body(&mut job);
         wal.write_put(&mut job).unwrap();
         assert_eq!(
             wal.reserved_bytes, after_put,
@@ -2094,6 +2198,7 @@ mod tests {
         );
 
         // A third migration — still no increase
+        external_body(&mut job);
         wal.write_put(&mut job).unwrap();
         assert_eq!(
             wal.reserved_bytes, after_put,
@@ -2144,6 +2249,7 @@ mod tests {
                 b"test-body".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job);
             wal.write_put(&mut job).unwrap();
 
             // reserve #1
@@ -2282,7 +2388,7 @@ mod tests {
         };
         assert_eq!(v3_record.len(), 38); // old size
 
-        let (rec, consumed) = deserialize_record(&v3_record).unwrap();
+        let (rec, consumed) = deserialize_record(&v3_record, WAL_VERSION).unwrap();
         assert_eq!(consumed, 38);
         if let WalRecord::StateChange {
             reason, new_state, ..
@@ -2323,6 +2429,7 @@ mod tests {
             b"a".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job1);
         wal.write_put(&mut job1).unwrap();
         let mut job2 = Job::new(
             2,
@@ -2332,6 +2439,7 @@ mod tests {
             b"b".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job2);
         wal.write_put(&mut job2).unwrap();
         wal.write_state_change(
             &mut job1,
@@ -2366,6 +2474,7 @@ mod tests {
             b"body".to_vec(),
             "default".to_string(),
         );
+        external_body(&mut job);
         wal.write_put(&mut job).unwrap();
 
         let baseline = wal.sync_count();
@@ -2414,6 +2523,7 @@ mod tests {
                 b"buffered".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job);
             wal.write_put(&mut job).unwrap();
             // Force a flush through maintain (the interval is far in the future,
             // so no fsync, but the BufWriter flush must still run).
@@ -2428,7 +2538,7 @@ mod tests {
         .unwrap();
         let (jobs, _, _) = wal.replay().unwrap();
         assert!(jobs.contains_key(&1), "job should survive buffered replay");
-        assert_eq!(jobs[&1].body_bytes(), b"buffered");
+        assert!(matches!(&jobs[&1].body, BodyRef::External(_)));
     }
 
     #[test]
@@ -2450,6 +2560,7 @@ mod tests {
                 b"shutdown".to_vec(),
                 "default".to_string(),
             );
+            external_body(&mut job);
             wal.write_put(&mut job).unwrap();
             wal.flush_and_sync();
             assert!(wal.sync_count() > before, "flush_and_sync must always sync");

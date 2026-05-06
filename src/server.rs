@@ -348,7 +348,23 @@ impl ServerState {
         self.total_job_bytes = self
             .total_job_bytes
             .saturating_sub(Self::job_memory_cost(&job));
+        // Drop the external body once the job is gone — the WAL's
+        // `wal_write_put` helper takes a job out and reinserts it during
+        // tracking updates, so we only release the body when the *caller*
+        // is genuinely deleting (the job won't be reinserted).
+        // Callers that round-trip a Job through this helper (compaction,
+        // bookkeeping) must put the job back via `insert_job` before
+        // anything else looks at it.
         Some(job)
+    }
+
+    /// Release the external body for a job that's being permanently
+    /// removed (delete, idempotency expiry on a deleted-and-tombstoned
+    /// job). No-op for inline bodies and for jobs in no-`-b` mode.
+    fn release_external_body(&self, job: &Job) {
+        if let (BodyRef::External(id), Some(bs)) = (&job.body, self.body_store.as_ref()) {
+            bs.delete(*id);
+        }
     }
 
     fn insert_tombstone(
@@ -719,12 +735,22 @@ impl ServerState {
         // TTL — that tombstone is part of the same budget, and admitting a
         // put we can't later cooldown would be dishonest. Release/bury/kick
         // never pass through this check because they don't add bytes.
+        //
+        // When persistence is on, body bytes leave RAM and live in the
+        // external body store, so they don't count toward the in-memory
+        // budget. The disk-budget enforcement for TOAST is its own check
+        // (see Phase 3C / `--max-storage-bytes`).
         let tombstone_cost = idempotency_key
             .as_ref()
             .filter(|(_, ttl)| *ttl > 0)
             .map(|(k, _)| k.len() as u64 + TOMBSTONE_OVERHEAD_BYTES)
             .unwrap_or(0);
-        let job_cost = body.len() as u64 + JOB_OVERHEAD_BYTES;
+        let body_in_ram = if self.body_store.is_some() {
+            0
+        } else {
+            body.len() as u64
+        };
+        let job_cost = body_in_ram + JOB_OVERHEAD_BYTES;
         if self.memory_limit_exceeded(job_cost + tombstone_cost) {
             return Response::OutOfMemory;
         }
@@ -836,14 +862,31 @@ impl ServerState {
         let id = self.next_job_id;
         self.next_job_id += 1;
 
+        // When the body store is in use, write bytes to TOAST first and
+        // hand the job an `External(BodyId)` reference. The WAL's v5
+        // serializer assumes External, and the sync coordinator inside
+        // `Wal` will fsync TOAST before the WAL record landing this id.
+        let body_ref = if let Some(bs) = self.body_store.as_ref() {
+            match bs.write_body(&body) {
+                Ok(body_id) => BodyRef::External(body_id),
+                Err(e) => {
+                    tracing::error!("body store write failed: {}", e);
+                    return Response::InternalError;
+                }
+            }
+        } else {
+            BodyRef::Inline(body)
+        };
+
         let mut job = Job::new(
             id,
             pri,
             Duration::from_secs(delay as u64),
             Duration::from_secs(ttr as u64),
-            body,
+            Vec::new(),
             tube_name.clone(),
         );
+        job.body = body_ref;
 
         // Set extension fields before inserting
         job.idempotency_key = idempotency_key;
@@ -1312,7 +1355,9 @@ impl ServerState {
             StateChangeReason::None,
         );
 
-        self.remove_job(id);
+        if let Some(job) = self.remove_job(id) {
+            self.release_external_body(&job);
+        }
 
         // Check if any group completed and promote waiting after-jobs
         if let Some(ref grp) = group_name {
@@ -1447,7 +1492,9 @@ impl ServerState {
         // WAL: write delete for each job, then remove from jobs map
         for &id in &job_ids {
             self.wal_write_state_change(id, None, 0, Duration::ZERO, 0, StateChangeReason::None);
-            self.remove_job(id);
+            if let Some(job) = self.remove_job(id) {
+                self.release_external_body(&job);
+            }
         }
 
         // Check if any affected groups completed
@@ -2774,9 +2821,46 @@ fn build_state(
         let on_disk = wal.total_disk_bytes();
 
         tracing::info!("WAL: replaying {} bytes from {:?}", on_disk, dir);
-        let (jobs, next_id, tombstones) = wal.replay()?;
+        let (mut jobs, next_id, tombstones) = wal.replay()?;
         let job_count = jobs.len();
         let tombstone_count = tombstones.len();
+
+        // Migrate inline bodies recovered from pre-v5 WAL records into the
+        // body store. The result is a uniform External world for all
+        // subsequent code paths (read, write, accounting, serialize). v5
+        // records already arrive as External — they're left alone.
+        let mut migrated = 0u64;
+        for job in jobs.values_mut() {
+            let job_id = job.id;
+            // Use a sentinel Inline(empty) while we move the original body
+            // out to satisfy the borrow checker. The match below restores
+            // the field in every branch.
+            let original = std::mem::replace(&mut job.body, BodyRef::Inline(Vec::new()));
+            match original {
+                BodyRef::Inline(bytes) => {
+                    let body_id = body_store.write_body(&bytes).map_err(|e| {
+                        io::Error::other(format!(
+                            "WAL→TOAST migration failed for job {}: {}",
+                            job_id, e
+                        ))
+                    })?;
+                    job.body = BodyRef::External(body_id);
+                    migrated += 1;
+                }
+                external @ BodyRef::External(_) => {
+                    job.body = external;
+                }
+            }
+        }
+        if migrated > 0 {
+            // Force the body store to disk before the WAL replay completes
+            // — bodies must outlive their referencing FullJob records.
+            body_store
+                .fsync()
+                .map_err(|e| io::Error::other(format!("body store fsync after migration: {}", e)))?;
+            tracing::info!("WAL→TOAST: migrated {} inline bodies into the body store", migrated);
+        }
+
         state.restore_jobs(jobs, next_id, tombstones);
 
         // Enforce the in-memory budget after replay. The WAL on-disk size
@@ -2796,6 +2880,9 @@ fn build_state(
             ));
         }
 
+        // Hand the body store to the WAL so every WAL fsync is preceded
+        // by a TOAST fsync — the durability invariant for v5 records.
+        wal.set_body_store(Arc::clone(&body_store));
         state.wal = Some(wal);
         state.body_store = Some(body_store);
         tracing::info!(

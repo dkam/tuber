@@ -35,12 +35,13 @@ impl BodyRef {
         }
     }
 
-    /// Length of the body in bytes. Panics on `External` for the same reason
-    /// as `as_bytes`.
+    /// Number of body bytes resident in RAM. `Inline` returns the actual
+    /// body length; `External` returns 0 because those bytes live in the
+    /// body store, not in this `Job`. Drives in-memory budget accounting.
     pub fn len(&self) -> usize {
         match self {
             BodyRef::Inline(v) => v.len(),
-            BodyRef::External(_) => unreachable!("body store not yet enabled"),
+            BodyRef::External(_) => 0,
         }
     }
 
