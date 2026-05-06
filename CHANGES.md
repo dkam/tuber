@@ -1,5 +1,28 @@
 # Changes
 
+## v0.5.7
+
+**Concurrency-keyed reserve throughput on large queues**
+
+Three compounding bottlenecks made flood-style workloads (many ready jobs sharing a small set of saturated `con:` keys) crawl at single-digit ops/sec on a 100K-entry tube. Measured: 16-worker `flood_con` on 100K jobs went from ~5 jobs/sec to ~2,860 jobs/sec.
+
+- `cmd_delete` now calls `process_queue` when a concurrency key is released and waiters exist (mirrors `cmd_release`). Previously a parked waiter only woke on the next tick.
+- `process_queue` precomputes the per-tube unblocked top once per outer pass and uses it for the cheap waiter-eligibility check. Drops per-delete cost from O(W × N) to O(N + W) when many waiters share the same watched tube.
+- `find_best_unblocked_ready` slow-path traversal is now capped at 256 nodes (new `FIND_UNBLOCKED_MAX_VISITS`). With saturated con: keys blocking many top jobs, the cap stops scans walking a 100K-entry heap on every reserve; missed jobs are picked up on the next event-driven re-check.
+- Replaced the slow path's `collect+sort+linear-scan` with a lazy in-heap-order traversal via an auxiliary `BinaryHeap`.
+- Tests: `test_cmd_delete_wakes_concurrency_waiter` (unit), `test_find_unblocked_returns_smallest_unblocked` (unit), `test_many_waiters_concurrency_keyed_drain` (integration, 32 waiters × 2,500 jobs).
+
+**Body storage abstraction (Phase 2 placeholder)**
+
+- Introduce `BodyRef::Inline(Vec<u8>)` / `BodyRef::External(BodyId)` enum to decouple `Job.body` from inline storage. `External` is reserved for a future external body store (TOAST) and is currently never constructed; access panics with a clear message.
+- Replace dead `JobState::Reserved` WAL replay arm with `unreachable!()`.
+
+## v0.5.6
+
+**Container health check**
+
+- Dockerfile `HEALTHCHECK` now invokes `tuber stats` so orchestrators (Docker, Kubernetes, Compose) can detect a hung server.
+
 ## v0.5.5
 
 **Fix WAL pre-flight check blocking restarts**
