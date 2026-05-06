@@ -2843,7 +2843,7 @@ fn build_state(
     max_job_bytes: Option<u64>,
     max_storage_bytes: Option<u64>,
     wal_dir: Option<&Path>,
-    wal_sync_interval: Duration,
+    sync_interval: Duration,
     name: Option<String>,
 ) -> io::Result<ServerState> {
     let mut state = ServerState::new(max_job_size, max_job_bytes, max_storage_bytes, name);
@@ -2864,7 +2864,7 @@ fn build_state(
             dir,
             crate::wal::WalConfig {
                 max_file_size: None,
-                sync_interval: wal_sync_interval,
+                sync_interval,
             },
         )?;
         let on_disk = wal.total_disk_bytes();
@@ -2952,7 +2952,7 @@ pub async fn run(
     max_job_bytes: Option<u64>,
     max_storage_bytes: Option<u64>,
     wal_dir: Option<&str>,
-    wal_sync_interval: Duration,
+    sync_interval: Duration,
     metrics_port: Option<u16>,
     name: Option<String>,
 ) -> io::Result<()> {
@@ -2962,7 +2962,7 @@ pub async fn run(
         max_job_bytes,
         max_storage_bytes,
         wal_path,
-        wal_sync_interval,
+        sync_interval,
         name.clone(),
     )?;
 
@@ -2976,10 +2976,10 @@ pub async fn run(
     }
     if let Some(ref dir) = wal_dir {
         opts.push_str(&format!(" binlog={dir}"));
-        if wal_sync_interval.is_zero() {
-            opts.push_str(" wal-sync=every-write");
+        if sync_interval.is_zero() {
+            opts.push_str(" sync=every-write");
         } else {
-            opts.push_str(&format!(" wal-sync={}ms", wal_sync_interval.as_millis()));
+            opts.push_str(&format!(" sync={}ms", sync_interval.as_millis()));
         }
     }
     if let Some(mp) = metrics_port {

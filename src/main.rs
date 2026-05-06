@@ -61,18 +61,25 @@ enum Commands {
         #[arg(short = 'b', long, env = "TUBER_BINLOG_DIR")]
         binlog_dir: Option<String>,
 
-        /// Minimum interval between WAL fsyncs (e.g. 0, 50ms, 1s).
-        /// "0" means fsync on every write (strongest durability; ack follows durability).
-        /// Positive values bound how much committed state can be lost on crash.
-        /// Only meaningful when --binlog-dir is set.
+        /// Minimum interval between fsyncs of the WAL and body store
+        /// (e.g. 0, 50ms, 1s). "0" means fsync on every write (strongest
+        /// durability; ack follows durability). Positive values bound how
+        /// much committed state can be lost on crash. Only meaningful when
+        /// --binlog-dir is set.
+        ///
+        /// `--wal-sync-interval` is accepted as a hidden alias for
+        /// backwards compatibility; new deployments should use
+        /// `--sync-interval`. The env var `TUBER_WAL_SYNC_INTERVAL` is
+        /// also still honoured.
         #[arg(
             long,
+            alias = "wal-sync-interval",
             default_value = "100ms",
             value_parser = parse_sync_interval,
             requires = "binlog_dir",
-            env = "TUBER_WAL_SYNC_INTERVAL"
+            env = "TUBER_SYNC_INTERVAL"
         )]
-        wal_sync_interval: Duration,
+        sync_interval: Duration,
 
         /// Maximum size of a single job's body.
         /// Accepts suffixes: k, m, g, t (e.g. 64k, 1m). Default: 65535.
@@ -194,6 +201,19 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    // Deprecation alias: honour the old `TUBER_WAL_SYNC_INTERVAL` env var
+    // when the new `TUBER_SYNC_INTERVAL` is unset, so existing deployments
+    // keep working unchanged. Stamp a one-shot warning the first time.
+    if std::env::var_os("TUBER_SYNC_INTERVAL").is_none()
+        && let Some(old) = std::env::var_os("TUBER_WAL_SYNC_INTERVAL")
+    {
+        eprintln!(
+            "tuber: TUBER_WAL_SYNC_INTERVAL is deprecated; use TUBER_SYNC_INTERVAL"
+        );
+        // SAFETY: mutating the process env before any threads spawn.
+        unsafe { std::env::set_var("TUBER_SYNC_INTERVAL", old) };
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -201,7 +221,7 @@ async fn main() {
             listen,
             port,
             binlog_dir,
-            wal_sync_interval,
+            sync_interval,
             max_job_size,
             max_jobs_size,
             max_storage_bytes,
@@ -222,7 +242,7 @@ async fn main() {
                 max_jobs_size,
                 max_storage_bytes,
                 binlog_dir.as_deref(),
-                wal_sync_interval,
+                sync_interval,
                 metrics_port,
                 name,
             )
