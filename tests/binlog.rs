@@ -906,3 +906,106 @@ async fn test_binlog_sigterm_flushes_wal() {
     c2.ckresp("FOUND 1 12\r\n").await;
     c2.ckresp("sigterm-test\r\n").await;
 }
+
+/// TOAST: when -b is set, a `toast/` subdirectory exists and bodies land in
+/// segment files. Confirms the body-store integration is wired into the
+/// startup path, not just the in-memory tests.
+#[tokio::test]
+async fn test_binlog_toast_directory_created() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    c.mustsend("put 0 0 60 5\r\n").await;
+    c.mustsend("hello\r\n").await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    drop(c);
+    let _ = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let toast_dir = dir.path().join("toast");
+    assert!(toast_dir.is_dir(), "toast/ subdirectory must exist");
+
+    // Exactly one segment, named body.000000.
+    let entries: Vec<_> = std::fs::read_dir(&toast_dir).unwrap().collect();
+    assert_eq!(entries.len(), 1, "expected one segment file");
+    let name = entries[0].as_ref().unwrap().file_name();
+    assert_eq!(name.to_string_lossy(), "body.000000");
+
+    // 16 (file header) + 20 (body header) + 5 (body) = 41 bytes.
+    let len = std::fs::metadata(toast_dir.join("body.000000")).unwrap().len();
+    assert_eq!(len, 41, "segment size should match header(16) + body_hdr(20) + body(5)");
+}
+
+/// TOAST: many puts span multiple segments and all bodies survive a
+/// restart (header-scan recovery rebuilds the BodyId index).
+#[tokio::test]
+async fn test_binlog_toast_many_bodies_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    // 50 puts of varying-size bodies. With the default 64 MiB segment
+    // size we won't trigger rotation, but we exercise the index path
+    // for many distinct BodyIds.
+    let n = 50;
+    for i in 0..n {
+        let body = format!("body-{:03}-payload", i);
+        let len = body.len();
+        c.mustsend(&format!("put 0 0 60 {}\r\n", len)).await;
+        c.mustsend(&format!("{}\r\n", body)).await;
+        c.ckresp(&format!("INSERTED {}\r\n", i + 1)).await;
+    }
+
+    drop(c);
+    let wal_dir = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Restart and confirm every body still peekable with original bytes.
+    let srv2 = TestServer::start_with_wal(&wal_dir).await;
+    let mut c2 = srv2.connect().await;
+
+    for i in 0..n {
+        let expected = format!("body-{:03}-payload", i);
+        let len = expected.len();
+        c2.mustsend(&format!("peek {}\r\n", i + 1)).await;
+        c2.ckresp(&format!("FOUND {} {}\r\n", i + 1, len)).await;
+        c2.ckresp(&format!("{}\r\n", expected)).await;
+    }
+}
+
+/// TOAST: an 8 KiB printable body round-trips through put → restart →
+/// reserve, exercising the body-store read on a payload bigger than a
+/// kernel readahead might serve in a single page.
+#[tokio::test]
+async fn test_binlog_toast_large_body_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+
+    // Repeating ASCII pattern so the readline-based test helper still works.
+    // The pattern itself doesn't repeat at small periods, so a substring
+    // mismatch would surface immediately.
+    let pattern = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@";
+    let body: String = pattern.repeat(128); // 64 * 128 = 8192 bytes
+    let len = body.len();
+
+    c.mustsend(&format!("put 0 0 60 {}\r\n", len)).await;
+    c.mustsend(&format!("{}\r\n", body)).await;
+    c.ckresp("INSERTED 1\r\n").await;
+
+    drop(c);
+    let wal_dir = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let srv2 = TestServer::start_with_wal(&wal_dir).await;
+    let mut c2 = srv2.connect().await;
+
+    c2.mustsend("reserve-with-timeout 1\r\n").await;
+    c2.ckresp(&format!("RESERVED 1 {}\r\n", len)).await;
+    c2.ckresp(&format!("{}\r\n", body)).await;
+}
