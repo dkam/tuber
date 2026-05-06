@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::job::{Job, JobState};
+#[cfg(test)]
+use crate::job::BodyRef;
 
 // --- Constants ---
 
@@ -225,8 +227,9 @@ pub fn serialize_full_job(job: &Job) -> Vec<u8> {
     );
 
     // body (last — largest variable-length field)
-    payload.extend_from_slice(&(job.body.len() as u32).to_le_bytes());
-    payload.extend_from_slice(&job.body);
+    let body_bytes = job.body_bytes();
+    payload.extend_from_slice(&(body_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(body_bytes);
 
     // Build full record: type + job_id + payload_len + payload + crc
     let mut record = Vec::with_capacity(1 + 8 + 4 + payload.len() + 4);
@@ -278,7 +281,7 @@ pub fn estimate_full_job_size(job: &Job) -> usize {
     //          body_len(4) + body + 4 option_strings (2 bytes each min) + concurrency_limit(4) + idp_ttl(4)
     let fixed = 17 + 4 + 8 + 8 + 8 + 1 + 20 + 2 + 4 + 8 + 4 + 4; // +4 concurrency limit +4 idp ttl
     let variable = job.tube_name.len()
-        + job.body.len()
+        + job.body_size()
         + job.idempotency_key.as_ref().map_or(0, |(s, _)| s.len())
         + job.group.as_ref().map_or(0, |s| s.len())
         + job.after_group.as_ref().map_or(0, |s| s.len())
@@ -1236,7 +1239,7 @@ mod tests {
             assert_eq!(j.priority, 100);
             assert_eq!(j.delay, Duration::from_secs(5));
             assert_eq!(j.ttr, Duration::from_secs(30));
-            assert_eq!(j.body, b"hello world");
+            assert_eq!(j.body_bytes(), b"hello world");
             assert_eq!(j.tube_name, "test-tube");
             assert_eq!(j.reserve_ct, 3);
             assert_eq!(j.timeout_ct, 1);
@@ -1249,6 +1252,8 @@ mod tests {
             assert_eq!(j.concurrency_key, Some(("conc".to_string(), 3)));
             // Reserved replays as Ready
             assert_eq!(j.state, JobState::Delayed); // original was delayed (delay > 0)
+            // Body must round-trip as Inline — Phase 2 invariant.
+            assert!(matches!(j.body, BodyRef::Inline(_)));
         } else {
             panic!("expected FullJob");
         }
@@ -1778,7 +1783,7 @@ mod tests {
             assert!(jobs.contains_key(&2));
             let j2 = &jobs[&2];
             assert_eq!(j2.priority, 20);
-            assert_eq!(j2.body, b"body2");
+            assert_eq!(j2.body_bytes(), b"body2");
             assert_eq!(j2.tube_name, "other");
             assert_eq!(j2.state, JobState::Delayed);
             assert!(next_id >= 3);
@@ -2058,7 +2063,7 @@ mod tests {
             assert!(jobs.contains_key(&1), "job 1 must survive replay after GC");
             let job = jobs.get(&1).unwrap();
             assert_eq!(job.state, JobState::Buried);
-            assert_eq!(job.body, b"important-data");
+            assert_eq!(job.body_bytes(), b"important-data");
         }
     }
 
@@ -2423,7 +2428,7 @@ mod tests {
         .unwrap();
         let (jobs, _, _) = wal.replay().unwrap();
         assert!(jobs.contains_key(&1), "job should survive buffered replay");
-        assert_eq!(jobs[&1].body, b"buffered");
+        assert_eq!(jobs[&1].body_bytes(), b"buffered");
     }
 
     #[test]

@@ -7,6 +7,48 @@ pub const URGENT_THRESHOLD: u32 = 1024;
 pub const JOB_DATA_SIZE_LIMIT_DEFAULT: u32 = 65535;
 pub const JOB_DATA_SIZE_LIMIT_MAX: u32 = 1_073_741_824;
 
+/// Logical identifier for a body stored in the (future) external body store.
+/// Monotonic and never reused. Phase 2 placeholder — only `BodyRef::External`
+/// will carry one, and that variant is not constructed yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BodyId(pub u64);
+
+/// Where a job's body lives.
+///
+/// In the current single-store design every body is `Inline`. The `External`
+/// variant exists so that future TOAST work can swap in body-store references
+/// without changing this enum's shape — for now any code path encountering
+/// `External` panics via `unreachable!`.
+#[derive(Debug, Clone)]
+pub enum BodyRef {
+    Inline(Vec<u8>),
+    External(BodyId),
+}
+
+impl BodyRef {
+    /// Borrow the inline body bytes. Panics on `External` — Phase 2 invariant
+    /// is that `External` is never constructed.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            BodyRef::Inline(v) => v,
+            BodyRef::External(_) => unreachable!("body store not yet enabled"),
+        }
+    }
+
+    /// Length of the body in bytes. Panics on `External` for the same reason
+    /// as `as_bytes`.
+    pub fn len(&self) -> usize {
+        match self {
+            BodyRef::Inline(v) => v.len(),
+            BodyRef::External(_) => unreachable!("body store not yet enabled"),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     Ready,
@@ -41,7 +83,7 @@ pub struct Job {
     pub priority: u32,
     pub delay: Duration,
     pub ttr: Duration,
-    pub body: Vec<u8>,
+    pub body: BodyRef,
     pub state: JobState,
     pub tube_name: String,
 
@@ -96,7 +138,7 @@ impl Job {
             priority,
             delay,
             ttr,
-            body,
+            body: BodyRef::Inline(body),
             state,
             tube_name,
             idempotency_key: None,
@@ -133,6 +175,11 @@ impl Job {
 
     pub fn body_size(&self) -> usize {
         self.body.len()
+    }
+
+    /// Borrow the body bytes. Panics on `External` (Phase 2 invariant).
+    pub fn body_bytes(&self) -> &[u8] {
+        self.body.as_bytes()
     }
 }
 
@@ -260,6 +307,31 @@ mod tests {
     fn test_job_reserved_at_none_on_creation() {
         let j = make_test_job(1, 10);
         assert!(j.reserved_at.is_none());
+    }
+
+    #[test]
+    fn test_body_ref_inline_round_trip() {
+        let job = Job::new(
+            1,
+            10,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            b"hello-toast".to_vec(),
+            "default".into(),
+        );
+        // Constructor wraps incoming bytes in BodyRef::Inline.
+        assert!(matches!(job.body, BodyRef::Inline(_)));
+        assert_eq!(job.body_bytes(), b"hello-toast");
+        assert_eq!(job.body_size(), 11);
+    }
+
+    #[test]
+    #[should_panic(expected = "body store not yet enabled")]
+    fn test_body_ref_external_unreachable() {
+        // External is defined but no code path constructs it in Phase 2.
+        // Touching its bytes panics with the documented message.
+        let body = BodyRef::External(BodyId(123));
+        let _ = body.as_bytes();
     }
 
     #[test]

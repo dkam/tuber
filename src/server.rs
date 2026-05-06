@@ -287,7 +287,7 @@ impl ServerState {
     // `self.jobs.remove`, and `idempotency_cooldowns` to audit.
 
     fn job_memory_cost(job: &Job) -> u64 {
-        job.body.len() as u64 + JOB_OVERHEAD_BYTES
+        job.body_size() as u64 + JOB_OVERHEAD_BYTES
     }
 
     fn tombstone_memory_cost(key: &str) -> u64 {
@@ -1045,7 +1045,7 @@ impl ServerState {
         let now = Instant::now();
         let (body, tube_name, created_at) = match self.jobs.get_mut(&job_id) {
             Some(job) => {
-                let body = job.body.clone();
+                let body = job.body_bytes().to_vec();
                 let tube_name = job.tube_name.clone();
                 let created_at = job.created_at;
                 job.state = JobState::Reserved;
@@ -1597,7 +1597,7 @@ impl ServerState {
         match self.jobs.get(&id) {
             Some(job) => Response::Found {
                 id,
-                body: job.body.clone(),
+                body: job.body_bytes().to_vec(),
             },
             None => Response::NotFound,
         }
@@ -1615,7 +1615,7 @@ impl ServerState {
         {
             return Response::Found {
                 id: job_id,
-                body: job.body.clone(),
+                body: job.body_bytes().to_vec(),
             };
         }
         Response::NotFound
@@ -1633,7 +1633,7 @@ impl ServerState {
         {
             return Response::Found {
                 id: job_id,
-                body: job.body.clone(),
+                body: job.body_bytes().to_vec(),
             };
         }
         Response::NotFound
@@ -1651,7 +1651,7 @@ impl ServerState {
         {
             return Response::Found {
                 id: job_id,
-                body: job.body.clone(),
+                body: job.body_bytes().to_vec(),
             };
         }
         Response::NotFound
@@ -1671,7 +1671,7 @@ impl ServerState {
         match found {
             Some(job) => Response::Found {
                 id: job.id,
-                body: job.body.clone(),
+                body: job.body_bytes().to_vec(),
             },
             None => Response::NotFound,
         }
