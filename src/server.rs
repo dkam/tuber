@@ -38,6 +38,12 @@ const TOMBSTONE_OVERHEAD_BYTES: u64 = 128;
 /// Below this threshold, raw weights are used.
 const FAIR_MIN_SAMPLES: u64 = 10;
 
+/// Cap on heap entries inspected by find_best_unblocked_ready when the heap
+/// top is concurrency-blocked. Bounds slow-path cost on large tubes; if the
+/// real unblocked job is deeper than this, the next process_queue tick or
+/// state-change event re-checks.
+const FIND_UNBLOCKED_MAX_VISITS: usize = 256;
+
 // Op index constants matching beanstalkd (see tmp/prot.c)
 const OP_PUT: usize = 1;
 const OP_PEEKJOB: usize = 2;
@@ -458,29 +464,38 @@ impl ServerState {
 
     /// Find the best unblocked ready job from a tube.
     /// Fast path: if top job is not blocked, return it.
-    /// Slow path: scan heap entries for first unblocked job.
+    /// Slow path: lazy in-heap-order traversal capped at FIND_UNBLOCKED_MAX_VISITS
+    /// nodes. With a saturated con: key blocking many top jobs, the cap stops
+    /// us from walking a 100K-entry heap in tight loops; missed jobs (a real
+    /// unblocked entry deeper than the cap) are picked up on the next event
+    /// that triggers process_queue.
     fn find_best_unblocked_ready(&self, tube: &Tube) -> Option<((u32, u64), u64)> {
-        if let Some(&entry) = tube.ready.peek() {
-            if !self.is_concurrency_blocked(entry.1) {
-                return Some(entry);
+        let entries = tube.ready.entries();
+        let top = *entries.first()?;
+        if !self.is_concurrency_blocked(top.1) {
+            return Some(top);
+        }
+
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut pending: BinaryHeap<Reverse<((u32, u64), u64, usize)>> = BinaryHeap::new();
+        pending.push(Reverse((top.0, top.1, 0)));
+        let mut visited = 0usize;
+        while let Some(Reverse((key, jid, idx))) = pending.pop() {
+            visited += 1;
+            if !self.is_concurrency_blocked(jid) {
+                return Some((key, jid));
             }
-            // Slow path: collect, sort, find first unblocked
-            let mut entries: Vec<((u32, u64), u64)> = tube
-                .ready
-                .entries()
-                .iter()
-                .map(|&(k, id)| (k, id))
-                .collect();
-            entries.sort();
-            for entry in entries {
-                if !self.is_concurrency_blocked(entry.1) {
-                    return Some(entry);
+            if visited >= FIND_UNBLOCKED_MAX_VISITS {
+                return None;
+            }
+            for child in [idx * 2 + 1, idx * 2 + 2] {
+                if let Some(&(k, id)) = entries.get(child) {
+                    pending.push(Reverse((k, id, child)));
                 }
             }
-            None
-        } else {
-            None
         }
+        None
     }
 
     fn handle_command(&mut self, conn_id: u64, cmd: Command, body: Option<Vec<u8>>) -> Response {
@@ -1268,6 +1283,12 @@ impl ServerState {
         // Check if any group completed and promote waiting after-jobs
         if let Some(ref grp) = group_name {
             self.check_group_completion(grp);
+        }
+
+        // Wake any parked reservers — releasing a concurrency slot or removing
+        // a buried/delayed job can unblock a previously blocked candidate.
+        if has_concurrency_key && !self.waiters.is_empty() {
+            self.process_queue();
         }
 
         Response::Deleted
@@ -2487,16 +2508,32 @@ impl ServerState {
             }
         }
 
-        // Second pass: try to fulfill remaining waiters one at a time.
-        // Each successful reserve changes the ready queue, so we re-check
-        // from the start after each fulfillment.
+        // Second pass: fulfill waiters one at a time. Each successful
+        // reserve changes the heap (and possibly concurrency-key state), so
+        // we recompute the per-tube unblocked-top cache once per outer pass
+        // and use it for the cheap waiter-eligibility check. Without this,
+        // each delete that calls process_queue with W parked waiters did
+        // O(W × N) heap scans; recomputing once per pass cuts that to O(N)
+        // when many waiters share the same watched tube.
         loop {
-            // Use immutable check to find a candidate waiter with a ready job.
-            // This works for both FIFO and weighted modes since
-            // find_ready_job_for_conn_inner just checks availability.
+            let mut tube_top: HashMap<String, ((u32, u64), u64)> = HashMap::new();
+            for (name, tube) in &self.tubes {
+                if tube.is_paused() {
+                    continue;
+                }
+                if let Some(top) = self.find_best_unblocked_ready(tube) {
+                    tube_top.insert(name.clone(), top);
+                }
+            }
+            if tube_top.is_empty() {
+                break;
+            }
+
             let mut fulfilled_idx = None;
             for (i, waiter) in self.waiters.iter().enumerate() {
-                if self.find_ready_job_for_conn_inner(waiter.conn_id).is_some() {
+                if let Some(conn) = self.conns.get(&waiter.conn_id)
+                    && conn.watched.iter().any(|w| tube_top.contains_key(&w.name))
+                {
                     fulfilled_idx = Some(i);
                     break;
                 }
@@ -2504,10 +2541,10 @@ impl ServerState {
 
             match fulfilled_idx {
                 Some(i) => {
-                    // Select the job respecting the connection's reserve mode.
-                    // Look up the job before decrementing stats so that if the
-                    // job was grabbed between check and reserve we can re-queue
-                    // the waiter with counters untouched.
+                    // Pick the job using the connection's reserve mode.
+                    // If find_job_for_waiting_conn returns None despite the
+                    // cache claiming availability (e.g., weighted RNG hit a
+                    // zero-weight tube), bail to avoid a tight retry loop.
                     let conn_id = self.waiters[i].conn_id;
                     if let Some(job_id) = self.find_job_for_waiting_conn(conn_id) {
                         let waiter = self.remove_waiter_at(i);

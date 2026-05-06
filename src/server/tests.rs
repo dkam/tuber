@@ -669,6 +669,104 @@ fn test_concurrency_key_default_limit_one() {
 }
 
 #[test]
+fn test_cmd_delete_wakes_concurrency_waiter() {
+    // A reserver parked while a con: slot is held must be fulfilled
+    // synchronously when the holder deletes the job. Without process_queue
+    // in cmd_delete, the waiter would only wake on the next tick.
+    let mut s = make_state();
+    let c1 = register(&mut s);
+    let c2 = register(&mut s);
+
+    let con_put = |s: &mut ServerState, conn: u64, body: &[u8]| {
+        let cmd = Command::Put {
+            pri: 0,
+            delay: 0,
+            ttr: 120,
+            bytes: body.len() as u32,
+            idempotency_key: None,
+            group: None,
+            after_group: None,
+            concurrency_key: Some(("k".into(), 1)),
+        };
+        s.handle_command(conn, cmd, Some(body.to_vec()))
+    };
+
+    con_put(&mut s, c1, b"j1");
+    con_put(&mut s, c1, b"j2");
+
+    // c1 reserves j1, taking the only con-key slot.
+    let r1 = s.handle_command(c1, Command::Reserve, None);
+    assert!(matches!(r1, Response::Reserved { id: 1, .. }));
+
+    // c2 parks as a waiter (j2 is con-blocked by j1's slot).
+    let (tx, mut rx) = oneshot::channel();
+    s.add_waiter(c2, tx, None);
+    assert_eq!(s.stats.waiting_ct, 1);
+
+    // c1 deletes j1 — slot freed, waiter must be fulfilled with j2.
+    let resp = s.handle_command(c1, Command::Delete { id: 1 }, None);
+    assert!(matches!(resp, Response::Deleted));
+
+    assert_eq!(
+        s.stats.waiting_ct, 0,
+        "delete must wake parked waiter when concurrency slot is freed"
+    );
+    let received = rx
+        .try_recv()
+        .expect("waiter should have received a response");
+    assert!(
+        matches!(received, Response::Reserved { id: 2, .. }),
+        "expected Reserved(2), got {:?}",
+        received
+    );
+}
+
+#[test]
+fn test_find_unblocked_returns_smallest_unblocked() {
+    // Correctness probe for find_best_unblocked_ready: with the heap top
+    // blocked by a con: key, the function must still return the
+    // lowest-priority unblocked job, not just any unblocked one.
+    let mut s = make_state();
+    let c1 = register(&mut s);
+    let _c2 = register(&mut s);
+
+    // j1: pri 1, con:k (blocks)
+    // j2: pri 2, no con      <- this is the smallest unblocked
+    // j3: pri 0, con:k (also blocked)  <- smallest overall but blocked
+    let put = |s: &mut ServerState, conn: u64, pri: u32, con: Option<(&str, u32)>, body: &[u8]| {
+        let cmd = Command::Put {
+            pri,
+            delay: 0,
+            ttr: 120,
+            bytes: body.len() as u32,
+            idempotency_key: None,
+            group: None,
+            after_group: None,
+            concurrency_key: con.map(|(k, n)| (k.to_string(), n)),
+        };
+        s.handle_command(conn, cmd, Some(body.to_vec()))
+    };
+
+    assert!(matches!(put(&mut s, c1, 1, Some(("k", 1)), b"a"), Response::Inserted(1)));
+    assert!(matches!(put(&mut s, c1, 2, None,             b"b"), Response::Inserted(2)));
+    assert!(matches!(put(&mut s, c1, 0, Some(("k", 1)), b"c"), Response::Inserted(3)));
+
+    // Reserve j3 (pri 0) — takes the con:k slot.
+    let r = s.handle_command(c1, Command::Reserve, None);
+    assert!(matches!(r, Response::Reserved { id: 3, .. }));
+
+    // Now j1 (pri 1, con:k) is at heap top but blocked.
+    // The next unblocked is j2 (pri 2, no con). We must NOT return
+    // anything else, even if a future change adds out-of-order traversal.
+    let r = s.handle_command(c1, Command::Reserve, None);
+    assert!(
+        matches!(r, Response::Reserved { id: 2, .. }),
+        "expected smallest-unblocked j2, got {:?}",
+        r
+    );
+}
+
+#[test]
 fn test_idempotency_ttl_cooldown() {
     let mut s = make_state();
     let c = register(&mut s);

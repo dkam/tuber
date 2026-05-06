@@ -5147,3 +5147,113 @@ async fn test_max_jobs_size_default_unlimited() {
         c.put_job(0, 0, 60, &format!("job-{i}")).await;
     }
 }
+
+// Regression guard for the process_queue waiter-scan amplification:
+// with W parked waiters and N ready jobs sharing a saturated con: key,
+// the pre-fix server did O(W × N) heap scans per delete. At W=32 and
+// N=2500 that translated to single-digit ops/sec and a multi-minute
+// drain; the post-fix server scans each tube once per outer pass and
+// finishes in seconds.
+#[tokio::test]
+async fn test_many_waiters_concurrency_keyed_drain() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const WORKERS: usize = 32;
+    const N_JOBS: usize = 2500;
+    const KEYS: usize = 5;
+    const TUBE: &str = "many-waiters-con";
+
+    let server = TestServer::start().await;
+    let port = server.port;
+
+    // Putter: insert all jobs across KEYS con-keys (limit 1 each).
+    let mut putter = server.connect().await;
+    putter.mustsend(&format!("use {}\r\n", TUBE)).await;
+    putter.ckrespsub(&format!("USING {}", TUBE)).await;
+    for i in 0..N_JOBS {
+        let body = format!("j{i}");
+        let cmd = format!(
+            "put 0 0 60 {} con:k{}:1\r\n",
+            body.len(),
+            i % KEYS
+        );
+        putter.mustsend(&cmd).await;
+        putter.mustsend(&format!("{}\r\n", body)).await;
+        putter.ckrespsub("INSERTED ").await;
+    }
+
+    let consumed = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(WORKERS);
+
+    for _ in 0..WORKERS {
+        let consumed = consumed.clone();
+        handles.push(tokio::spawn(async move {
+            let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut buf = String::new();
+
+            writer
+                .write_all(format!("watch {}\r\n", TUBE).as_bytes())
+                .await
+                .unwrap();
+            reader.read_line(&mut buf).await.unwrap();
+            buf.clear();
+            writer.write_all(b"ignore default\r\n").await.unwrap();
+            reader.read_line(&mut buf).await.unwrap();
+            buf.clear();
+
+            loop {
+                writer
+                    .write_all(b"reserve-with-timeout 1\r\n")
+                    .await
+                    .unwrap();
+                buf.clear();
+                reader.read_line(&mut buf).await.unwrap();
+                if buf.starts_with("TIMED_OUT") || buf.starts_with("DEADLINE_SOON") {
+                    break;
+                }
+                assert!(buf.starts_with("RESERVED "), "{:?}", buf);
+                let parts: Vec<&str> = buf.trim_end().split_whitespace().collect();
+                let id: u64 = parts[1].parse().unwrap();
+                let body_len: usize = parts[2].parse().unwrap();
+                let mut body_buf = vec![0u8; body_len + 2];
+                reader.read_exact(&mut body_buf).await.unwrap();
+
+                writer
+                    .write_all(format!("delete {}\r\n", id).as_bytes())
+                    .await
+                    .unwrap();
+                buf.clear();
+                reader.read_line(&mut buf).await.unwrap();
+                assert!(buf.starts_with("DELETED"), "{:?}", buf);
+                consumed.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    let start = std::time::Instant::now();
+    let drain = async {
+        for h in handles {
+            h.await.unwrap();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), drain)
+        .await
+        .expect("drain did not complete within 30s — process_queue scan amplification");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        consumed.load(Ordering::Relaxed),
+        N_JOBS,
+        "expected to drain {} jobs",
+        N_JOBS
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "drain took {:?}, expected under 30s",
+        elapsed
+    );
+}
