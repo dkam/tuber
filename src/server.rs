@@ -158,10 +158,11 @@ struct ServerState {
     /// `None` disables the check.
     max_job_bytes: Option<u64>,
     /// Optional combined disk budget for the WAL + body store (bytes). When
-    /// set, `cmd_put` returns `OUT_OF_STORAGE` once the budget — minus a
-    /// reserved slice for state-change records — would be exceeded. State
-    /// changes (delete, release, bury, kick, touch) ignore this cap.
-    /// `None` disables the check, matching pre-Phase-3C behaviour.
+    /// set, `cmd_put` returns `OUT_OF_STORAGE` once accepting a body would
+    /// push the projected footprint (live disk + a one-WAL-segment reserve
+    /// for future state-change records) past the budget. State changes
+    /// (delete, release, bury, kick, touch) bypass this cap so an operator
+    /// can always drain a wedged queue. `None` disables the check.
     max_storage_bytes: Option<u64>,
     /// Running sum of `job_memory_cost` for all jobs plus `tombstone_memory_cost`
     /// for every live idempotency-cooldown entry. Maintained via the
@@ -373,14 +374,17 @@ impl ServerState {
             Some(w) => w,
             None => return false,
         };
-        // Per-body TOAST overhead: 20-byte header + worst-case file-header
-        // amortisation (~16 bytes per body if every put rotated).
-        const BODY_OVERHEAD: u64 = 64;
+        // Per-body TOAST overhead: record header + worst-case file-header
+        // amortisation when every put forces a fresh segment, plus padding
+        // so this stays a generous over-estimate as the layout evolves.
+        const BODY_OVERHEAD: u64 =
+            (crate::body_store::BODY_HEADER_SIZE + crate::body_store::FILE_HEADER_SIZE) as u64 + 28;
         let toast_bytes = self.body_store.as_ref().map_or(0, |bs| bs.total_bytes());
         let wal_bytes = wal.total_disk_bytes();
-        // Reserve: one WAL segment's worth, capped at 10 MB so very small
-        // segment configurations still leave room for state-change churn.
-        let wal_reserve = (wal.max_file_size() as u64).max(10 * 1024 * 1024);
+        // Floor of one WAL segment, but never less than the WAL default
+        // segment size — small custom `max_file_size` configurations must
+        // still leave room for state-change churn before refusing puts.
+        let wal_reserve = (wal.max_file_size() as u64).max(crate::wal::DEFAULT_MAX_FILE_SIZE as u64);
         let projected = wal_bytes
             .saturating_add(toast_bytes)
             .saturating_add(body_len)
@@ -3049,6 +3053,47 @@ pub async fn run_with_listener_limited(
 /// Run the engine task and accept loop with a fully-built [`ServerState`].
 async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32) -> io::Result<()> {
     let (engine_tx, mut engine_rx) = mpsc::channel::<EngineMsg>(1024);
+
+    // TOAST compaction lives in its own task: when a sealed segment's live
+    // ratio drops below the threshold, copy its surviving bodies into the
+    // current write segment and unlink the old file. The engine task
+    // remains the sole writer of `ServerState`; compaction only touches
+    // `BodyStore`, which is internally synchronized.
+    if let Some(bs) = state.body_store.as_ref() {
+        let bs = Arc::clone(bs);
+        tokio::spawn(async move {
+            // 5 s is brisk enough to keep up with realistic delete bursts
+            // without burning cycles on idle queues. The threshold mirrors
+            // beanstalkd's WAL compaction default.
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let candidate = bs.compaction_candidate(0.5);
+                let Some(seq) = candidate else { continue };
+                // The compaction itself is synchronous file IO; on a 64 MiB
+                // segment with a typical mix this is well under 100 ms,
+                // shorter than a tick. Run inside the task and accept the
+                // brief stall — `spawn_blocking` would only matter if we
+                // expected multi-second compactions.
+                match bs.compact_segment(seq) {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::info!(
+                                "TOAST compacted segment {}: migrated {} bodies",
+                                seq, n
+                            );
+                        } else {
+                            tracing::debug!("TOAST compacted segment {}: empty", seq);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("TOAST compaction failed for segment {}: {}", seq, e);
+                    }
+                }
+            }
+        });
+    }
 
     // Shrink the engine tick when the WAL fsync interval is tighter than the
     // default 100 ms tick, so fsync cadence isn't rate-limited by the tick.
