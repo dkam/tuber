@@ -24,8 +24,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::job::BodyId;
 
@@ -88,14 +88,7 @@ pub struct BodyLocation {
 }
 
 struct Segment {
-    /// Equal to the BTreeMap key. Stored for use by compaction in a
-    /// future phase.
-    #[allow(dead_code)]
-    seq: u64,
-    /// Filesystem path. Kept for compaction (which renames/unlinks).
-    #[allow(dead_code)]
-    path: PathBuf,
-    file: File,
+    file: Arc<File>,
     /// Total bytes used in the file (including file header and all body
     /// headers). Equal to the next-write offset for the current segment.
     total_bytes: u64,
@@ -149,14 +142,12 @@ impl BodyStore {
         let mut max_body_id: u64 = 0;
 
         for seq in &seqs {
-            let path = dir.join(format!("{}{:06}", TOAST_FILE_PREFIX, seq));
+            let path = segment_path(dir, *seq);
             let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
             let scan = scan_segment(&mut file)?;
             let mut live_bytes: u64 = 0;
             for entry in scan.entries {
-                if entry.body_id.0 >= max_body_id {
-                    max_body_id = entry.body_id.0 + 1;
-                }
+                max_body_id = max_body_id.max(entry.body_id.0 + 1);
                 live_bytes += entry.len as u64;
                 index.insert(
                     entry.body_id,
@@ -165,7 +156,7 @@ impl BodyStore {
             }
             segments.insert(
                 *seq,
-                Segment { seq: *seq, path, file, total_bytes: scan.consumed, live_bytes },
+                Segment { file: Arc::new(file), total_bytes: scan.consumed, live_bytes },
             );
         }
 
@@ -208,11 +199,7 @@ impl BodyStore {
         let body_offset = header_offset + BODY_HEADER_SIZE as u64;
 
         let crc = crc32fast::hash(bytes);
-        let mut header = [0u8; BODY_HEADER_SIZE];
-        header[0..8].copy_from_slice(&body_id.0.to_le_bytes());
-        header[8..12].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
-        header[12..16].copy_from_slice(&crc.to_le_bytes());
-        // bytes 16..20 reserved, zero
+        let header = encode_body_header(body_id, bytes.len() as u32, crc);
 
         seg.file.write_all_at(&header, header_offset)?;
         seg.file.write_all_at(bytes, body_offset)?;
@@ -229,27 +216,29 @@ impl BodyStore {
     }
 
     /// Read the body bytes for `id`. Verifies the body's CRC against the
-    /// header recorded at write time.
+    /// header recorded at write time. The inner lock is released before
+    /// disk IO, so reads can proceed concurrently.
     pub fn read_body(&self, id: BodyId) -> Result<Vec<u8>, BodyStoreError> {
-        let inner = self.inner.lock().unwrap();
-        let location = inner
-            .index
-            .get(&id)
-            .copied()
-            .ok_or(BodyStoreError::NotFound(id))?;
-        let seg = inner
-            .segments
-            .get(&location.seq)
-            .ok_or(BodyStoreError::NotFound(id))?;
+        let (file, location) = {
+            let inner = self.inner.lock().unwrap();
+            let location = inner
+                .index
+                .get(&id)
+                .copied()
+                .ok_or(BodyStoreError::NotFound(id))?;
+            let seg = inner
+                .segments
+                .get(&location.seq)
+                .expect("indexed body's segment must exist");
+            (Arc::clone(&seg.file), location)
+        };
 
-        // Header sits immediately before the body bytes.
         let mut header = [0u8; BODY_HEADER_SIZE];
-        seg.file
-            .read_exact_at(&mut header, location.offset - BODY_HEADER_SIZE as u64)?;
+        file.read_exact_at(&mut header, location.offset - BODY_HEADER_SIZE as u64)?;
         let expected_crc = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
 
         let mut buf = vec![0u8; location.len as usize];
-        seg.file.read_exact_at(&mut buf, location.offset)?;
+        file.read_exact_at(&mut buf, location.offset)?;
 
         let found_crc = crc32fast::hash(&buf);
         if found_crc != expected_crc {
@@ -275,14 +264,18 @@ impl BodyStore {
         }
     }
 
-    /// `fsync` the current segment file. Sealed segments are not re-synced —
-    /// they were synced when last written.
+    /// `fsync` the current segment file. Sealed segments are synced before
+    /// rotation, so they don't need re-syncing here.
     pub fn fsync(&self) -> Result<(), BodyStoreError> {
-        let inner = self.inner.lock().unwrap();
-        if let Some(seq) = inner.current_seq
-            && let Some(seg) = inner.segments.get(&seq)
-        {
-            seg.file.sync_data()?;
+        let file = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .current_seq
+                .and_then(|seq| inner.segments.get(&seq))
+                .map(|seg| Arc::clone(&seg.file))
+        };
+        if let Some(file) = file {
+            file.sync_data()?;
         }
         Ok(())
     }
@@ -310,9 +303,17 @@ impl BodyStore {
 
 impl Inner {
     fn rotate(&mut self, dir: &Path) -> Result<(), BodyStoreError> {
+        // Seal the previous segment durably before flipping current_seq —
+        // otherwise its tail bytes may not survive a crash.
+        if let Some(prev_seq) = self.current_seq
+            && let Some(prev) = self.segments.get(&prev_seq)
+        {
+            prev.file.sync_data()?;
+        }
+
         let seq = self.next_seq;
         self.next_seq += 1;
-        let path = dir.join(format!("{}{:06}", TOAST_FILE_PREFIX, seq));
+        let path = segment_path(dir, seq);
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -325,9 +326,7 @@ impl Inner {
         self.segments.insert(
             seq,
             Segment {
-                seq,
-                path,
-                file,
+                file: Arc::new(file),
                 total_bytes: FILE_HEADER_SIZE as u64,
                 live_bytes: 0,
             },
@@ -339,12 +338,31 @@ impl Inner {
 
 // --- File-level helpers ---
 
+fn segment_path(dir: &Path, seq: u64) -> PathBuf {
+    dir.join(format!("{}{:06}", TOAST_FILE_PREFIX, seq))
+}
+
+fn encode_body_header(body_id: BodyId, len: u32, crc: u32) -> [u8; BODY_HEADER_SIZE] {
+    let mut h = [0u8; BODY_HEADER_SIZE];
+    h[0..8].copy_from_slice(&body_id.0.to_le_bytes());
+    h[8..12].copy_from_slice(&len.to_le_bytes());
+    h[12..16].copy_from_slice(&crc.to_le_bytes());
+    h
+}
+
+fn decode_body_header(h: &[u8; BODY_HEADER_SIZE]) -> (BodyId, u32) {
+    let body_id = BodyId(u64::from_le_bytes([
+        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+    ]));
+    let len = u32::from_le_bytes([h[8], h[9], h[10], h[11]]);
+    (body_id, len)
+}
+
 fn write_file_header(file: &mut File) -> io::Result<()> {
     use std::io::Write;
     let mut buf = [0u8; FILE_HEADER_SIZE];
     buf[0..4].copy_from_slice(TOAST_MAGIC);
     buf[4..8].copy_from_slice(&TOAST_VERSION.to_le_bytes());
-    // bytes 8..16 reserved, zero
     file.write_all(&buf)?;
     Ok(())
 }
@@ -395,11 +413,7 @@ fn scan_segment(file: &mut File) -> Result<SegmentScan, BodyStoreError> {
     while offset + BODY_HEADER_SIZE as u64 <= file_len {
         let mut bh = [0u8; BODY_HEADER_SIZE];
         file.read_exact_at(&mut bh, offset)?;
-
-        let body_id = BodyId(u64::from_le_bytes([
-            bh[0], bh[1], bh[2], bh[3], bh[4], bh[5], bh[6], bh[7],
-        ]));
-        let len = u32::from_le_bytes([bh[8], bh[9], bh[10], bh[11]]);
+        let (body_id, len) = decode_body_header(&bh);
         let body_offset = offset + BODY_HEADER_SIZE as u64;
         let next_offset = body_offset + len as u64;
 
@@ -431,8 +445,8 @@ mod tests {
 
     /// Deterministic xorshift PRNG, in tests only. Avoids pulling in `rand`
     /// for a few lines of fuzz-coverage.
-    struct Lcg(u64);
-    impl Lcg {
+    struct Xorshift(u64);
+    impl Xorshift {
         fn new(seed: u64) -> Self {
             Self(seed.max(1))
         }
@@ -467,7 +481,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Small segment size to force several rotations.
         let bs = BodyStore::open(tmp.path(), 32 * 1024).unwrap();
-        let mut rng = Lcg::new(42);
+        let mut rng = Xorshift::new(42);
 
         let mut written: Vec<(BodyId, Vec<u8>)> = Vec::new();
         for _ in 0..1000 {
@@ -492,7 +506,7 @@ mod tests {
         let mut written: Vec<(BodyId, Vec<u8>)> = Vec::new();
         {
             let bs = BodyStore::open(tmp.path(), 8 * 1024).unwrap();
-            let mut rng = Lcg::new(1);
+            let mut rng = Xorshift::new(1);
             for _ in 0..50 {
                 let len = rng.gen_range(64, 256);
                 let mut body = vec![0u8; len];
@@ -581,7 +595,7 @@ mod tests {
             let inner = bs.inner.lock().unwrap();
             let loc = inner.index.get(&id).copied().unwrap();
             body_offset = loc.offset;
-            path = inner.segments.get(&loc.seq).unwrap().path.clone();
+            path = segment_path(&bs.dir, loc.seq);
         }
 
         // Flip a byte in the body region.
