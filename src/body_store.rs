@@ -43,6 +43,12 @@ const TOAST_FILE_PREFIX: &str = "body.";
 /// `--toast-segment-size` flag.
 pub const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Live-bytes ratio below which a sealed segment becomes a compaction
+/// candidate. At 0.5, half-empty segments get rewritten — small enough
+/// that the rewrite cost is bounded, large enough that fragmentation
+/// stays in check.
+pub const COMPACTION_LIVE_RATIO_THRESHOLD: f64 = 0.5;
+
 // --- Errors ---
 
 #[derive(Debug)]
@@ -129,6 +135,13 @@ pub struct BodyStore {
     total_bytes: AtomicU64,
     /// Sum of body bytes still referenced. Compaction trigger.
     live_bytes: AtomicU64,
+    /// Number of `compact_segment` calls that ran to completion (including
+    /// no-op compactions of empty segments). Surfaced via `stats`.
+    compactions_total: AtomicU64,
+    /// Number of bodies physically rewritten across all compactions.
+    /// Useful for spotting churn that's costing IO without freeing much
+    /// disk.
+    bodies_migrated_total: AtomicU64,
     inner: Mutex<Inner>,
 }
 
@@ -191,6 +204,8 @@ impl BodyStore {
             next_body_id: AtomicU64::new(max_body_id),
             total_bytes: AtomicU64::new(total_bytes_acc),
             live_bytes: AtomicU64::new(live_bytes_acc),
+            compactions_total: AtomicU64::new(0),
+            bodies_migrated_total: AtomicU64::new(0),
             inner: Mutex::new(Inner { segments, current_seq, next_seq, index }),
         })
     }
@@ -202,8 +217,27 @@ impl BodyStore {
     /// subsequent [`BodyStore::fsync`].
     pub fn write_body(&self, bytes: &[u8]) -> Result<BodyId, BodyStoreError> {
         let body_id = BodyId(self.next_body_id.fetch_add(1, Ordering::SeqCst));
+        let crc = crc32fast::hash(bytes);
         let mut inner = self.inner.lock().unwrap();
+        let location = self.append_body_locked(&mut inner, body_id, bytes, crc)?;
+        inner.index.insert(body_id, location);
+        self.live_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Ok(body_id)
+    }
 
+    /// Append a body to the current segment under the lock, rotating
+    /// first if needed. Updates per-segment counters and the global
+    /// `total_bytes` atomic but does **not** insert into the index or
+    /// touch `live_bytes` — callers handle those, since `write_body`
+    /// adds a new live entry while `migrate_body` only relocates.
+    fn append_body_locked(
+        &self,
+        inner: &mut Inner,
+        body_id: BodyId,
+        bytes: &[u8],
+        crc: u32,
+    ) -> Result<BodyLocation, BodyStoreError> {
         let needs_rotation = match inner.current_seq {
             None => true,
             Some(seq) => {
@@ -212,7 +246,6 @@ impl BodyStore {
                     > self.segment_size
             }
         };
-
         if needs_rotation {
             inner.rotate(&self.dir)?;
             self.total_bytes
@@ -220,30 +253,27 @@ impl BodyStore {
         }
 
         let current_seq = inner.current_seq.expect("rotation populates current_seq");
-        let seg = inner.segments.get_mut(&current_seq).expect("current segment present");
+        let seg = inner
+            .segments
+            .get_mut(&current_seq)
+            .expect("current segment present");
         let header_offset = seg.total_bytes;
         let body_offset = header_offset + BODY_HEADER_SIZE as u64;
 
-        let crc = crc32fast::hash(bytes);
         let header = encode_body_header(body_id, bytes.len() as u32, crc);
-
         seg.file.write_all_at(&header, header_offset)?;
         seg.file.write_all_at(bytes, body_offset)?;
 
         seg.total_bytes = body_offset + bytes.len() as u64;
         seg.live_bytes += bytes.len() as u64;
-
-        inner.index.insert(
-            body_id,
-            BodyLocation { seq: current_seq, offset: body_offset, len: bytes.len() as u32 },
-        );
-
         let added = (BODY_HEADER_SIZE as u64) + bytes.len() as u64;
         self.total_bytes.fetch_add(added, Ordering::Relaxed);
-        self.live_bytes
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
 
-        Ok(body_id)
+        Ok(BodyLocation {
+            seq: current_seq,
+            offset: body_offset,
+            len: bytes.len() as u32,
+        })
     }
 
     /// Read the body bytes for `id`. Verifies the body's CRC against the
@@ -358,6 +388,16 @@ impl BodyStore {
         inner.segments.len()
     }
 
+    /// Number of `compact_segment` calls completed since startup.
+    pub fn compactions_total(&self) -> u64 {
+        self.compactions_total.load(Ordering::Relaxed)
+    }
+
+    /// Number of bodies physically rewritten by compaction since startup.
+    pub fn bodies_migrated_total(&self) -> u64 {
+        self.bodies_migrated_total.load(Ordering::Relaxed)
+    }
+
     /// Pick a sealed segment (i.e. not the one currently being appended to)
     /// whose live ratio has dropped below `threshold` (in [0.0, 1.0]). The
     /// most-wasted segment wins; ties go to the lowest seq. Returns `None`
@@ -368,6 +408,7 @@ impl BodyStore {
     /// natural happy case — every body got deleted, so the entire file
     /// is reclaimable.
     pub fn compaction_candidate(&self, threshold: f64) -> Option<u64> {
+        let threshold = threshold.clamp(0.0, 1.0);
         let inner = self.inner.lock().unwrap();
         let current = inner.current_seq;
         let mut best: Option<(u64, f64)> = None;
@@ -425,11 +466,26 @@ impl BodyStore {
 
         let mut migrated = 0u64;
         for (body_id, old_loc) in body_ids {
-            // Read body bytes from the old segment outside the lock.
+            // Read body + its existing record header from the old segment
+            // outside the lock. Pulling the header lets us reuse the
+            // original CRC instead of re-hashing the body, and validates
+            // the move source against silent disk corruption.
+            let mut header = [0u8; BODY_HEADER_SIZE];
+            seg_file.read_exact_at(&mut header, old_loc.offset - BODY_HEADER_SIZE as u64)?;
+            let expected_crc =
+                u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
             let mut buf = vec![0u8; old_loc.len as usize];
             seg_file.read_exact_at(&mut buf, old_loc.offset)?;
+            let found_crc = crc32fast::hash(&buf);
+            if found_crc != expected_crc {
+                return Err(BodyStoreError::BadCrc {
+                    expected: expected_crc,
+                    found: found_crc,
+                    body_id,
+                });
+            }
 
-            if self.migrate_body(body_id, &buf, old_loc)? {
+            if self.migrate_body(body_id, &buf, expected_crc, old_loc)? {
                 migrated += 1;
             }
         }
@@ -446,17 +502,23 @@ impl BodyStore {
             .fetch_sub(segment_total, Ordering::Relaxed);
         let _ = std::fs::remove_file(&path);
 
+        self.compactions_total.fetch_add(1, Ordering::Relaxed);
+        self.bodies_migrated_total
+            .fetch_add(migrated, Ordering::Relaxed);
+
         Ok(migrated)
     }
 
     /// Append a single migrated body to the current segment and atomically
     /// flip the index entry. Returns `Ok(true)` if migrated, `Ok(false)` if
     /// the index no longer points at `expected_old` (deleted or already
-    /// migrated by a concurrent path).
+    /// migrated by a concurrent path). The caller passes the CRC from the
+    /// original record so we don't re-hash bytes the read just verified.
     fn migrate_body(
         &self,
         body_id: BodyId,
         bytes: &[u8],
+        crc: u32,
         expected_old: BodyLocation,
     ) -> Result<bool, BodyStoreError> {
         let mut inner = self.inner.lock().unwrap();
@@ -469,45 +531,12 @@ impl BodyStore {
             _ => return Ok(false),
         }
 
-        // Rotate the current segment if this body wouldn't fit.
-        let needs_rotation = match inner.current_seq {
-            None => true,
-            Some(cs) => {
-                let seg = inner.segments.get(&cs).expect("current segment present");
-                seg.total_bytes + (BODY_HEADER_SIZE as u64) + (bytes.len() as u64)
-                    > self.segment_size
-            }
-        };
-        if needs_rotation {
-            inner.rotate(&self.dir)?;
-            self.total_bytes
-                .fetch_add(FILE_HEADER_SIZE as u64, Ordering::Relaxed);
-        }
+        let new_location = self.append_body_locked(&mut inner, body_id, bytes, crc)?;
+        inner.index.insert(body_id, new_location);
 
-        let current_seq = inner.current_seq.expect("rotation populates current_seq");
-        let seg = inner.segments.get_mut(&current_seq).expect("current segment present");
-        let header_offset = seg.total_bytes;
-        let body_offset = header_offset + BODY_HEADER_SIZE as u64;
-
-        let crc = crc32fast::hash(bytes);
-        let header = encode_body_header(body_id, bytes.len() as u32, crc);
-        seg.file.write_all_at(&header, header_offset)?;
-        seg.file.write_all_at(bytes, body_offset)?;
-
-        seg.total_bytes = body_offset + bytes.len() as u64;
-        seg.live_bytes += bytes.len() as u64;
-        let added = (BODY_HEADER_SIZE as u64) + bytes.len() as u64;
-        self.total_bytes.fetch_add(added, Ordering::Relaxed);
-        // Live bytes are conserved across the move — the AtomicU64 sum
-        // doesn't change, only the per-segment partitioning does.
-
-        inner.index.insert(
-            body_id,
-            BodyLocation { seq: current_seq, offset: body_offset, len: bytes.len() as u32 },
-        );
-
-        // Decrement the old segment's live_bytes — the bytes there are now
-        // garbage. The old segment is sealed; this only affects accounting.
+        // Live bytes are conserved across the move — the global atomic is
+        // untouched. The old segment's per-segment live_bytes drops; the
+        // bytes still occupy disk until the segment is unlinked.
         if let Some(old_seg) = inner.segments.get_mut(&expected_old.seq) {
             old_seg.live_bytes = old_seg.live_bytes.saturating_sub(bytes.len() as u64);
         }
@@ -858,6 +887,20 @@ mod tests {
         assert_eq!(bs.compaction_candidate(0.5), Some(0));
         // A high threshold (above 1.0) still won't pick the current segment.
         assert_ne!(bs.compaction_candidate(2.0), Some(2));
+    }
+
+    #[test]
+    fn compaction_candidate_clamps_threshold_to_unit_range() {
+        let tmp = TempDir::new().unwrap();
+        let bs = BodyStore::open(tmp.path(), 600).unwrap();
+        let id_a = bs.write_body(&vec![0xAA; 500]).unwrap(); // seg 0
+        let _id_b = bs.write_body(&vec![0xBB; 500]).unwrap(); // seg 1 (current)
+        bs.delete(id_a);
+
+        // 5.0 collapses to 1.0 — picks seg 0 (live ratio 0.0 < 1.0).
+        assert_eq!(bs.compaction_candidate(5.0), Some(0));
+        // -1.0 collapses to 0.0 — no segment has a ratio below zero.
+        assert_eq!(bs.compaction_candidate(-1.0), None);
     }
 
     #[test]

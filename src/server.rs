@@ -46,6 +46,11 @@ const FAIR_MIN_SAMPLES: u64 = 10;
 /// state-change event re-checks.
 const FIND_UNBLOCKED_MAX_VISITS: usize = 256;
 
+/// Interval at which the background TOAST compactor scans for sealed
+/// segments below the live-ratio threshold. Brisk enough to absorb
+/// realistic delete bursts without burning cycles on idle queues.
+const TOAST_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
+
 // Op index constants matching beanstalkd (see tmp/prot.c)
 const OP_PUT: usize = 1;
 const OP_PEEKJOB: usize = 2;
@@ -2266,6 +2271,25 @@ impl ServerState {
                 None => (0, 0, 0, 0, 0),
             };
 
+        // TOAST stats. All zero when persistence is off, mirroring how the
+        // binlog-* fields behave so the YAML schema stays stable.
+        let (
+            toast_total_bytes,
+            toast_live_bytes,
+            toast_segments,
+            toast_compactions_total,
+            toast_bodies_migrated_total,
+        ) = match &self.body_store {
+            Some(bs) => (
+                bs.total_bytes(),
+                bs.live_bytes(),
+                bs.segment_count() as u64,
+                bs.compactions_total(),
+                bs.bodies_migrated_total(),
+            ),
+            None => (0, 0, 0, 0, 0),
+        };
+
         let yaml = format!(
             "---\n\
              current-jobs-urgent: {}\n\
@@ -2323,6 +2347,12 @@ impl ServerState {
              binlog-enabled: {}\n\
              binlog-file-count: {}\n\
              binlog-total-bytes: {}\n\
+             toast-total-bytes: {}\n\
+             toast-live-bytes: {}\n\
+             toast-segments: {}\n\
+             toast-compactions-total: {}\n\
+             toast-bodies-migrated-total: {}\n\
+             max-storage-bytes: {}\n\
              current-concurrency-keys: {}\n\
              draining: {}\n\
              id: {}\n\
@@ -2384,6 +2414,12 @@ impl ServerState {
             if self.wal.is_some() { "true" } else { "false" },
             binlog_file_count,
             binlog_total_bytes,
+            toast_total_bytes,
+            toast_live_bytes,
+            toast_segments,
+            toast_compactions_total,
+            toast_bodies_migrated_total,
+            self.max_storage_bytes.unwrap_or(0),
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
             self.instance_id,
@@ -3059,41 +3095,52 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
     // current write segment and unlink the old file. The engine task
     // remains the sole writer of `ServerState`; compaction only touches
     // `BodyStore`, which is internally synchronized.
-    if let Some(bs) = state.body_store.as_ref() {
-        let bs = Arc::clone(bs);
-        tokio::spawn(async move {
-            // 5 s is brisk enough to keep up with realistic delete bursts
-            // without burning cycles on idle queues. The threshold mirrors
-            // beanstalkd's WAL compaction default.
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let candidate = bs.compaction_candidate(0.5);
-                let Some(seq) = candidate else { continue };
-                // The compaction itself is synchronous file IO; on a 64 MiB
-                // segment with a typical mix this is well under 100 ms,
-                // shorter than a tick. Run inside the task and accept the
-                // brief stall — `spawn_blocking` would only matter if we
-                // expected multi-second compactions.
-                match bs.compact_segment(seq) {
-                    Ok(n) => {
-                        if n > 0 {
+    let compaction_shutdown = Arc::new(tokio::sync::Notify::new());
+    let compaction_handle: Option<tokio::task::JoinHandle<()>> =
+        if let Some(bs) = state.body_store.as_ref() {
+            let bs = Arc::clone(bs);
+            let shutdown = Arc::clone(&compaction_shutdown);
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(TOAST_COMPACTION_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.notified() => break,
+                        _ = interval.tick() => {}
+                    }
+                    let Some(seq) = bs.compaction_candidate(
+                        crate::body_store::COMPACTION_LIVE_RATIO_THRESHOLD,
+                    ) else {
+                        continue;
+                    };
+                    // The compaction itself is synchronous file IO; on a 64 MiB
+                    // segment with a typical mix this is well under 100 ms,
+                    // shorter than a tick. Run inside the task and accept the
+                    // brief stall — `spawn_blocking` would only matter if we
+                    // expected multi-second compactions.
+                    match bs.compact_segment(seq) {
+                        Ok(n) if n > 0 => {
                             tracing::info!(
                                 "TOAST compacted segment {}: migrated {} bodies",
                                 seq, n
                             );
-                        } else {
+                        }
+                        Ok(_) => {
                             tracing::debug!("TOAST compacted segment {}: empty", seq);
                         }
-                    }
-                    Err(e) => {
-                        tracing::error!("TOAST compaction failed for segment {}: {}", seq, e);
+                        Err(e) => {
+                            tracing::error!(
+                                "TOAST compaction failed for segment {}: {}",
+                                seq, e
+                            );
+                        }
                     }
                 }
-            }
-        });
-    }
+            }))
+        } else {
+            None
+        };
 
     // Shrink the engine tick when the WAL fsync interval is tighter than the
     // default 100 ms tick, so fsync cadence isn't rate-limited by the tick.
@@ -3212,6 +3259,14 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
     // then await the task so the WAL is fully flushed before we return.
     drop(engine_tx);
     let _ = engine_handle.await;
+
+    // Stop compaction after the engine has drained: an in-flight migration
+    // can take the BodyStore mutex briefly, so the engine's final fsync
+    // shouldn't race against it. notify_one + await joins cleanly.
+    if let Some(handle) = compaction_handle {
+        compaction_shutdown.notify_one();
+        let _ = handle.await;
+    }
 
     Ok(())
 }

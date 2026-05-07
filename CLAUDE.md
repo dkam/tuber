@@ -35,7 +35,21 @@ The codebase mirrors the original C beanstalkd structure:
 - **`src/cmd_stats.rs`** - CLI `stats` command: displays global or per-tube statistics.
 - **`src/cmd_tubes.rs`** - CLI `tubes` command: lists all tubes with job count summaries.
 - **`src/cmd_work.rs`** - CLI `work` command: reserves and executes jobs as shell commands with parallel workers.
-- **`src/metrics.rs`** - Prometheus metrics HTTP server (optional, enabled with `--metrics-port`).
+- **`src/body_store.rs`** - External body store ("TOAST"). Append-only segment files (`body.NNNNNN`) under `<binlog_dir>/toast/` hold raw job payloads addressed by `BodyId`. Used when persistence is enabled so the WAL only references bodies by id rather than carrying their bytes. Background tokio task compacts sealed segments whose live ratio drops below `COMPACTION_LIVE_RATIO_THRESHOLD` (0.5).
+- **`src/metrics.rs`** - Prometheus metrics HTTP server (optional, enabled with `--metrics-port`). Exposes WAL, TOAST, jobs, and per-tube gauges/counters.
+
+## Persistence model (when `-b` is set)
+
+Two on-disk stores side by side:
+
+- **WAL** (`binlog.NNNNNN` files): metadata records — `FullJob` carrying a `BodyId` reference and `StateChange` for delete/release/bury/kick/timeout. v5 is current; v3 and v4 inline-body records are still readable and migrated into TOAST on first replay.
+- **TOAST** (`toast/body.NNNNNN`): append-only body segments. Per-body record header is `body_id u64 + len u32 + crc32 u32 + reserved u32` followed by the bytes. File header is `"TBOD" + version + reserved`.
+
+**Sync ordering:** every WAL fsync is preceded by a TOAST fsync (`Wal::pre_sync_body_store`). A crash mid-sync leaves orphan bodies, never dangling references — orphans are detected on replay and reclaimed via `BodyStore::delete_many`.
+
+**Disk budget:** `--max-storage-bytes` caps WAL + TOAST combined. Puts return `OUT_OF_STORAGE` once the budget minus a one-WAL-segment reserve (≤10 MiB) would be exceeded; state changes (delete/release/bury/kick/touch) always succeed.
+
+**Sync interval:** `--sync-interval` (env `TUBER_SYNC_INTERVAL`, default 100 ms) drives both stores. `--wal-sync-interval` is accepted as a hidden alias for backwards compatibility.
 
 ## Key Constants from Original C (dat.h)
 
@@ -45,7 +59,10 @@ The codebase mirrors the original C beanstalkd structure:
 - `JOB_DATA_SIZE_LIMIT_MAX`: 1GB (1073741824)
 - `MAX_TUBE_WEIGHT`: 9999 (for weighted reserve mode)
 - Default port: 11300
-- WAL version: 7
+- WAL version: 5 (reads v3, v4, v5; writes v5)
+- TOAST version: 1
+- TOAST default segment size: 64 MiB
+- TOAST compaction threshold: live ratio < 0.5
 
 ## Beanstalkd Protocol Commands
 
@@ -58,7 +75,7 @@ Tuber extensions beyond standard beanstalkd:
 - `put` extension tags (appended after `<bytes>`): `idp:<key>` (idempotency), `grp:<name>` (job group), `aft:<name>` (after-group dependency), `con:<key>` (concurrency key).
 - `watch <tube> [weight]` - optional weight parameter for weighted reserve mode.
 
-Responses are text, e.g. `INSERTED <id>\r\n`, `RESERVED <id> <bytes>\r\n`, `DELETED\r\n`, `NOT_FOUND\r\n`, `BAD_FORMAT\r\n`.
+Responses are text, e.g. `INSERTED <id>\r\n`, `RESERVED <id> <bytes>\r\n`, `DELETED\r\n`, `NOT_FOUND\r\n`, `BAD_FORMAT\r\n`. Two budget-exhausted responses: `OUT_OF_MEMORY\r\n` (in-RAM cap from `--max-jobs-size`) and `OUT_OF_STORAGE\r\n` (combined disk cap from `--max-storage-bytes`).
 
 ## Testing Strategy
 

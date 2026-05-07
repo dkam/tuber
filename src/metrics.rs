@@ -211,6 +211,36 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         "max-jobs-size",
     );
 
+    // TOAST (external body store) gauges. Zero when persistence is off.
+    prom_gauge(
+        &mut out,
+        "tuber_toast_total_bytes",
+        "Total bytes used across all TOAST segment files",
+        &stats,
+        "toast-total-bytes",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_toast_live_bytes",
+        "Body bytes still referenced by live BodyIds (drives compaction)",
+        &stats,
+        "toast-live-bytes",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_toast_segments",
+        "Number of TOAST segment files on disk",
+        &stats,
+        "toast-segments",
+    );
+    prom_gauge(
+        &mut out,
+        "tuber_max_storage_bytes",
+        "Configured --max-storage-bytes limit (0 if unlimited)",
+        &stats,
+        "max-storage-bytes",
+    );
+
     // Counters
     prom_counter(
         &mut out,
@@ -240,6 +270,20 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
          current-jobs-size with an empty live set (every increment is a bug)",
         &stats,
         "accounting-drift-events",
+    );
+    prom_counter(
+        &mut out,
+        "tuber_toast_compactions_total",
+        "TOAST segment compactions completed since startup",
+        &stats,
+        "toast-compactions-total",
+    );
+    prom_counter(
+        &mut out,
+        "tuber_toast_bodies_migrated_total",
+        "Bodies physically rewritten by TOAST compaction since startup",
+        &stats,
+        "toast-bodies-migrated-total",
     );
 
     // Command counters (labeled)
