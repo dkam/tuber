@@ -1113,6 +1113,73 @@ async fn test_binlog_toast_large_body_restart() {
     c2.ckresp(&format!("{}\r\n", body)).await;
 }
 
+/// Startup integrity check: WAL records pointing at TOAST bodies that
+/// no longer exist on disk get reaped before they can poison the queue.
+/// Simulates the disk-corruption / operator-`rm` / compaction-CRC-drop
+/// scenarios — the TOAST-then-WAL fsync invariant means a clean crash
+/// shouldn't produce this, but it does happen in the wild and a
+/// missing-body job at the top of a tube would INTERNAL_ERROR every
+/// reserve attempt.
+#[tokio::test]
+async fn test_startup_reaps_jobs_with_missing_toast_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // First run: put two jobs, shut down cleanly so the WAL+TOAST are
+    // both fully on disk.
+    {
+        let srv = TestServer::start_with_wal(dir.path()).await;
+        let mut c = srv.connect().await;
+        c.mustsend("put 0 0 60 5\r\n").await;
+        c.mustsend("aaaaa\r\n").await;
+        c.ckresp("INSERTED 1\r\n").await;
+        c.mustsend("put 0 0 60 5\r\n").await;
+        c.mustsend("bbbbb\r\n").await;
+        c.ckresp("INSERTED 2\r\n").await;
+        drop(c);
+        let _ = srv.shutdown();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Wipe the TOAST segment — both bodies are in body.000000 (tiny
+    // payloads, default 64 MiB segment). The WAL still references them.
+    let toast_seg = dir.path().join("toast").join("body.000000");
+    assert!(toast_seg.exists(), "TOAST segment must exist before removal");
+    std::fs::remove_file(&toast_seg).expect("rm toast segment");
+
+    // Second run: server starts (no refusal), both jobs get reaped, and
+    // the count is surfaced in stats.
+    {
+        let srv = TestServer::start_with_wal(dir.path()).await;
+        let mut c = srv.connect().await;
+        c.mustsend("peek 1\r\n").await;
+        c.ckresp("NOT_FOUND\r\n").await;
+        c.mustsend("peek 2\r\n").await;
+        c.ckresp("NOT_FOUND\r\n").await;
+        c.mustsend("stats\r\n").await;
+        let body = c.read_ok_body().await;
+        assert!(
+            body.contains("recovered-missing-bodies: 2"),
+            "stats must report 2 reaped jobs: {body}",
+        );
+        drop(c);
+        let _ = srv.shutdown();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Third run: the reaping was journalled, so this restart sees no
+    // missing-body warnings and the count is back to 0.
+    {
+        let srv = TestServer::start_with_wal(dir.path()).await;
+        let mut c = srv.connect().await;
+        c.mustsend("stats\r\n").await;
+        let body = c.read_ok_body().await;
+        assert!(
+            body.contains("recovered-missing-bodies: 0"),
+            "second restart should see no new reaping: {body}",
+        );
+    }
+}
+
 /// `--max-storage-bytes`: once the combined WAL+TOAST footprint plus a
 /// one-segment WAL reserve (≈10 MB) would exceed the budget, new puts
 /// are refused with `OUT_OF_STORAGE`. State changes (delete) always

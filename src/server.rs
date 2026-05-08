@@ -115,6 +115,12 @@ struct GlobalStats {
     /// `total_job_bytes` while the live set (jobs + tombstones) was empty.
     /// Every increment is a tuber bug; alert on it.
     accounting_drift_events: u64,
+    /// Jobs reaped at startup because their WAL FullJob record referenced
+    /// a `BodyId` that wasn't present in TOAST (segment header corruption,
+    /// manual file removal, or the corruption-drop path in
+    /// `compact_segment`). One-shot value set during `build_state`.
+    /// Every nonzero value indicates lost data — alert on it.
+    recovered_missing_bodies: u64,
 }
 
 /// State for a job group (grp:/aft: feature).
@@ -2374,6 +2380,7 @@ impl ServerState {
              toast-compactions-total: {}\n\
              toast-bodies-migrated-total: {}\n\
              toast-bodies-dropped-corrupted: {}\n\
+             recovered-missing-bodies: {}\n\
              max-storage-bytes: {}\n\
              current-concurrency-keys: {}\n\
              draining: {}\n\
@@ -2442,6 +2449,7 @@ impl ServerState {
             toast_compactions_total,
             toast_bodies_migrated_total,
             toast_bodies_dropped_corrupted,
+            self.stats.recovered_missing_bodies,
             self.max_storage_bytes.unwrap_or(0),
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
@@ -3043,7 +3051,58 @@ fn build_state(
             tracing::info!("WAL→TOAST: migrated {} inline bodies into the body store", migrated);
         }
 
-        state.restore_jobs(jobs, next_id, tombstones);
+        // Integrity check: WAL records that reference TOAST bodies which
+        // no longer exist (segment corruption, manual `rm`, or the
+        // CRC-failure drop in `compact_segment`). The TOAST-then-WAL
+        // fsync ordering means a clean crash should never produce this,
+        // but disk faults and operator mistakes can. Reap before
+        // `restore_jobs` so we don't have to unwind heaps + stats — the
+        // broken jobs never enter the live set. Each reap is journalled
+        // as a state-change-delete so the next restart sees them gone.
+        let mut reaped: Vec<Job> = Vec::new();
+        let kept: HashMap<u64, Job> = jobs
+            .into_iter()
+            .filter_map(|(id, job)| {
+                if let BodyRef::External(body_id) = &job.body
+                    && !body_store.contains_body(*body_id)
+                {
+                    tracing::error!(
+                        job_id = id,
+                        tube = %job.tube_name,
+                        body_id = body_id.0,
+                        state = job.state.as_str(),
+                        "WAL references body missing from TOAST: reaping job (lost data)",
+                    );
+                    reaped.push(job);
+                    None
+                } else {
+                    Some((id, job))
+                }
+            })
+            .collect();
+        let recovered_missing_bodies = reaped.len() as u64;
+        for mut job in reaped {
+            // Best-effort: journal the delete so the warning doesn't
+            // re-fire on every restart. WAL errors here aren't fatal —
+            // in-memory state is already correct (the job is gone), and
+            // the next restart will just re-reap.
+            if let Err(e) = wal.write_state_change(
+                &mut job,
+                None,
+                0,
+                Duration::ZERO,
+                0,
+                StateChangeReason::None,
+            ) {
+                tracing::error!(
+                    job_id = job.id,
+                    "WAL delete journal failed for reaped job: {}", e,
+                );
+            }
+        }
+        state.stats.recovered_missing_bodies = recovered_missing_bodies;
+
+        state.restore_jobs(kept, next_id, tombstones);
 
         // Enforce the in-memory budget after replay. The WAL on-disk size
         // is not a reliable proxy (tombstones, superseded records, and format

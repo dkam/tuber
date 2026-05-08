@@ -419,6 +419,16 @@ impl BodyStore {
         self.bodies_dropped_corrupted.load(Ordering::Relaxed)
     }
 
+    /// Whether the given `BodyId` is known to the in-memory index. Cheap:
+    /// a single HashMap lookup, no IO and no CRC verification. Used by
+    /// the startup integrity check to detect WAL records referencing
+    /// bodies that no longer exist in TOAST (silent bit-rot in a segment
+    /// header, manual file removal, the corruption-drop path in
+    /// `compact_segment`, etc.).
+    pub fn contains_body(&self, id: BodyId) -> bool {
+        self.inner.lock().unwrap().index.contains_key(&id)
+    }
+
     /// Pick a sealed segment (i.e. not the one currently being appended to)
     /// whose live ratio has dropped below `threshold` (in [0.0, 1.0]). The
     /// most-wasted segment wins; ties go to the lowest seq. Returns `None`
