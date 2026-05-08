@@ -465,6 +465,23 @@ synchronisation point.
   in two segments. On restart the header scan iterates segments in seq
   order; the new (later) location wins via `index.insert`. Subsequent
   compaction reclaims the duplicate.
+- **Missing-body reaping** — TOAST-then-WAL ordering rules out the
+  WAL→missing-body direction *for clean crashes*, but disk corruption,
+  manual file removal, and the corruption-drop path in `compact_segment`
+  can all leave WAL FullJob records pointing at body ids that no longer
+  exist in the index. On startup, every such job is reaped (logged with
+  `body_id` / `tube` / `state`, deleted from the live set, and journalled
+  as a state-change-delete so the warning doesn't re-fire). The reaped
+  count is surfaced as `recovered-missing-bodies` in `stats`. A
+  missing-body job that survived to runtime would `INTERNAL_ERROR` every
+  reserve attempt against it — startup reaping prevents that poison-pill
+  state.
+
+  **Operational note:** `rm -rf <wal-dir>/toast/` (or any other
+  catastrophic loss of TOAST while the WAL survives) reaps **every**
+  job — there's nothing to serve their bodies from. This is honest:
+  the bodies are gone, so the jobs are. Move the WAL aside too if you
+  want a clean restart with no recovery noise.
 
 ## TOAST Version History
 

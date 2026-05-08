@@ -3059,6 +3059,11 @@ fn build_state(
         // `restore_jobs` so we don't have to unwind heaps + stats — the
         // broken jobs never enter the live set. Each reap is journalled
         // as a state-change-delete so the next restart sees them gone.
+        //
+        // Operational consequence: wiping `<wal-dir>/toast/` while the
+        // WAL survives reaps every job. There's nothing to serve their
+        // bodies from. Operators who want a clean restart should move
+        // the WAL aside too.
         let mut reaped: Vec<Job> = Vec::new();
         let kept: HashMap<u64, Job> = jobs
             .into_iter()
