@@ -386,10 +386,16 @@ impl ServerState {
             (crate::body_store::BODY_HEADER_SIZE + crate::body_store::FILE_HEADER_SIZE) as u64 + 28;
         let toast_bytes = self.body_store.as_ref().map_or(0, |bs| bs.total_bytes());
         let wal_bytes = wal.total_disk_bytes();
-        // Floor of one WAL segment, but never less than the WAL default
-        // segment size — small custom `max_file_size` configurations must
-        // still leave room for state-change churn before refusing puts.
-        let wal_reserve = (wal.max_file_size() as u64).max(crate::wal::DEFAULT_MAX_FILE_SIZE as u64);
+        // Reserve one WAL segment's worth of headroom for state-change
+        // churn, matching the design doc ("WAL gets a small reserved
+        // minimum, one segment's worth"). For the default 10 MiB segment
+        // this is 10 MiB — same as before. The absolute floor protects
+        // pathological configs (max_file_size in the kilobyte range)
+        // without imposing the default segment size on operators who
+        // deliberately picked a smaller one. ~1600 state-change records
+        // fit in 64 KiB, well above any realistic per-tick burst.
+        const MIN_WAL_RESERVE: u64 = 64 * 1024;
+        let wal_reserve = (wal.max_file_size() as u64).max(MIN_WAL_RESERVE);
         let projected = wal_bytes
             .saturating_add(toast_bytes)
             .saturating_add(body_len)
