@@ -285,6 +285,23 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         &stats,
         "toast-bodies-migrated-total",
     );
+    prom_counter(
+        &mut out,
+        "tuber_toast_bodies_dropped_corrupted_total",
+        "Bodies skipped (treated as deleted) during compaction because their \
+         CRC check failed. Alert on rate>0 — every increment is bit-rot.",
+        &stats,
+        "toast-bodies-dropped-corrupted",
+    );
+    prom_counter(
+        &mut out,
+        "tuber_recovered_missing_bodies_total",
+        "Jobs reaped at startup because their WAL FullJob referenced a \
+         BodyId that wasn't in the TOAST index. Alert on rate>0 — every \
+         increment is a TOAST integrity event.",
+        &stats,
+        "recovered-missing-bodies",
+    );
 
     // Command counters (labeled)
     let cmd_keys = [

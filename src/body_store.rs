@@ -412,9 +412,7 @@ impl BodyStore {
         self.bodies_migrated_total.load(Ordering::Relaxed)
     }
 
-    /// Number of bodies dropped during compaction due to CRC failure.
-    /// Every nonzero value means real bit-rot has happened on disk —
-    /// alert on it.
+    /// Bit-rot counter — see the `bodies_dropped_corrupted` field doc.
     pub fn bodies_dropped_corrupted(&self) -> u64 {
         self.bodies_dropped_corrupted.load(Ordering::Relaxed)
     }
@@ -503,6 +501,11 @@ impl BodyStore {
         };
 
         let mut migrated = 0u64;
+        // Bit-rotted bodies discovered during this compaction. We collect
+        // and delete them in one batch at the end of the loop instead of
+        // calling self.delete() per body — a single delete_many takes the
+        // inner mutex once instead of once per corrupt body.
+        let mut corrupted: Vec<BodyId> = Vec::new();
         for (body_id, old_loc) in body_ids {
             // Read body + its existing record header from the old segment
             // outside the lock. Pulling the header lets us reuse the
@@ -528,14 +531,18 @@ impl BodyStore {
                     found_crc = format!("{:08x}", found_crc),
                     "TOAST corruption: dropping body during compaction",
                 );
-                self.delete(body_id);
-                self.bodies_dropped_corrupted.fetch_add(1, Ordering::Relaxed);
+                corrupted.push(body_id);
                 continue;
             }
 
             if self.migrate_body(body_id, &buf, expected_crc, old_loc)? {
                 migrated += 1;
             }
+        }
+        if !corrupted.is_empty() {
+            self.bodies_dropped_corrupted
+                .fetch_add(corrupted.len() as u64, Ordering::Relaxed);
+            self.delete_many(&corrupted);
         }
 
         // Force migrated bytes to disk before unlinking the old segment.
