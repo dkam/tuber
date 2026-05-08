@@ -99,7 +99,7 @@ impl TestServer {
                 listener,
                 65535,
                 Some(max_jobs_size),
-                None,
+                Some(1024 * 1024 * 1024), // generous default budget; this test exercises max_jobs_size, not storage
                 Some(wal_dir_clone.as_path()),
                 true, // tests can carry pre-v5 fixtures; allow migration
                 None,
@@ -168,7 +168,7 @@ impl TestServer {
                 listener,
                 65535,
                 None,
-                None,
+                Some(1024 * 1024 * 1024), // generous default budget; legacy-WAL tests don't exercise storage
                 Some(wal_dir_clone.as_path()),
                 migrate_wal,
                 None,
@@ -962,6 +962,8 @@ async fn test_binlog_sigterm_flushes_wal() {
             &port.to_string(),
             "-b",
             wal_path.to_str().unwrap(),
+            "--max-storage-bytes",
+            "1g",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1157,22 +1159,30 @@ async fn test_max_storage_bytes_returns_out_of_storage() {
     c.ckresp("DELETED\r\n").await;
 }
 
-/// Without `--max-storage-bytes`, the budget check is a no-op even when
-/// the WAL+TOAST footprint is large. Mirrors current production
-/// behaviour for operators who haven't opted into the cap yet.
+/// `--max-storage-bytes` is mandatory whenever `-b` is set. Trying to
+/// start a server with a WAL directory but no storage budget must fail
+/// with a clear error pointing at the missing flag.
 #[tokio::test]
-async fn test_no_storage_budget_lets_puts_through() {
+async fn test_storage_budget_required_with_binlog() {
+    use std::path::Path;
     let dir = tempfile::tempdir().unwrap();
-    let srv = TestServer::start_with_wal(dir.path()).await;
-    let mut c = srv.connect().await;
-
-    let body = "y".repeat(60 * 1024);
-    let len = body.len();
-    for i in 0..50 {
-        c.mustsend(&format!("put 0 0 60 {}\r\n", len)).await;
-        c.mustsend(&format!("{}\r\n", body)).await;
-        c.ckresp(&format!("INSERTED {}\r\n", i + 1)).await;
-    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let result = tuber::server::run_with_listener_limited(
+        listener,
+        65535,
+        None,
+        None, // no storage budget
+        Some(Path::new(dir.path())),
+        true,
+        None,
+    )
+    .await;
+    let err = result.expect_err("must reject -b without --max-storage-bytes");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("--max-storage-bytes"),
+        "error message must name the missing flag, got: {msg}"
+    );
 }
 
 /// Hand-craft a v4 WAL file containing one inline-body FullJob record. We

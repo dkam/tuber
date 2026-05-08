@@ -2937,6 +2937,19 @@ fn build_state(
     let mut state = ServerState::new(max_job_size, max_job_bytes, max_storage_bytes, name);
 
     if let Some(dir) = wal_dir {
+        // Persistence requires an explicit disk budget. Without one, TOAST
+        // grows unbounded and the operator typically realises only after
+        // the disk fills — exactly the footgun the design doc set out to
+        // avoid. Refuse to start with a clear pointer at the missing flag.
+        if max_storage_bytes.is_none() {
+            return Err(io::Error::other(
+                "--binlog-dir requires --max-storage-bytes (env TUBER_MAX_STORAGE_BYTES). \
+                 Pick a number you'd be comfortable having entirely consumed by the queue \
+                 — Tuber will return OUT_OF_STORAGE on puts once the projected WAL+TOAST \
+                 footprint would exceed it. Suggested starting point: 80% of the volume.",
+            ));
+        }
+
         // Open the WAL first so we can peek at file format versions before
         // doing any TOAST/body-store work — that way a refusal returns
         // cleanly with no on-disk side effects.
@@ -3146,7 +3159,20 @@ pub async fn run_with_listener(
 ) -> io::Result<()> {
     // Test-only entry point: enable migration so legacy fixtures work
     // without the integration-test harness gaining a flag of its own.
-    run_with_listener_limited(listener, max_job_size, None, None, wal_dir, true, name).await
+    // When a WAL is requested, supply a generous default disk budget so
+    // tests don't have to thread one through — production callers must
+    // set --max-storage-bytes explicitly (enforced in `build_state`).
+    let default_budget: Option<u64> = wal_dir.map(|_| 1024 * 1024 * 1024);
+    run_with_listener_limited(
+        listener,
+        max_job_size,
+        None,
+        default_budget,
+        wal_dir,
+        true,
+        name,
+    )
+    .await
 }
 
 /// Like [`run_with_listener`] but with explicit memory and storage budgets.
