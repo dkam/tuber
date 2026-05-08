@@ -87,7 +87,9 @@ enum Commands {
         max_job_size: u32,
 
         /// Maximum total in-memory size of all jobs (bodies + per-job overhead
-        /// + idempotency tombstones). PUT returns OUT_OF_MEMORY once exceeded;
+        /// + idempotency tombstones).
+        ///
+        /// PUT returns OUT_OF_MEMORY once exceeded;
         /// reserve/release/bury/kick/delete always succeed. Also enforced at
         /// startup: replay aborts if the binlog would exceed the budget in
         /// memory. Accepts suffixes: k, m, g, t (e.g. 2g, 500M, 100k).
