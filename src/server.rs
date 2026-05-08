@@ -3217,8 +3217,17 @@ enum ProcessResult {
 
 /// Run a single Command through `state.handle_command` and classify the
 /// outcome. Reserve-with-timeout that returns `TimedOut` is bounced onto
-/// the waiter list (reply held by the waiter, returns `Deferred`); every
-/// other path inspects `wal_is_dirty()` to decide Pending vs. Immediate.
+/// the waiter list (reply held by the waiter, returns `Deferred`).
+///
+/// Durability mode is controlled by `--sync-interval`:
+/// - `sync_interval == 0`: **strict.** Defer the ack (Pending) so the
+///   engine's drain-then-fsync loop covers the whole batch with one fsync
+///   before any client hears `INSERTED`. This is the group-commit hot path.
+/// - `sync_interval > 0`: **relaxed.** Ack immediately even though the
+///   WAL has buffered bytes; the tick branch will fsync within
+///   `sync_interval` of every write. Up to `sync_interval` of acked work
+///   can be lost on a process kill or power failure. This is the
+///   pre-Phase-8 default behaviour and the throughput operators expect.
 fn dispatch_command(
     state: &mut ServerState,
     conn_id: u64,
@@ -3247,7 +3256,10 @@ fn dispatch_command(
         return DispatchOutcome::Deferred;
     }
 
-    if state.wal_is_dirty() {
+    let strict = state
+        .wal_sync_interval()
+        .is_some_and(|i| i.is_zero());
+    if strict && state.wal_is_dirty() {
         DispatchOutcome::Pending(reply_tx, resp)
     } else {
         DispatchOutcome::Immediate(reply_tx, resp)
@@ -3369,12 +3381,20 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
         .filter(|d| !d.is_zero() && *d < default_tick)
         .unwrap_or(default_tick);
 
-    // Engine task. Group commit shape:
-    //   1. Receive a message; dispatch it.
-    //   2. Drain the channel non-blocking up to MAX_BATCH.
-    //   3. If the batch dirtied the WAL, fsync once for the whole batch.
-    //   4. Send every deferred ack; clients see their responses only AFTER
-    //      sync, so the durability invariant — "ack ⇒ on disk" — holds.
+    // Engine task. Two durability modes governed by `--sync-interval`:
+    //
+    //   sync_interval == 0  → strict, group-commit hot path:
+    //     1. Receive a message; dispatch it (Pending if dirty).
+    //     2. Drain the channel non-blocking up to MAX_BATCH.
+    //     3. fsync once covering the whole batch.
+    //     4. Send every deferred ack — clients see their `INSERTED` only
+    //        AFTER sync, so the durability invariant "ack ⇒ on disk" holds.
+    //
+    //   sync_interval >  0  → relaxed:
+    //     dispatch acks Immediately even on dirty writes (Pending is never
+    //     produced). The tick branch fsyncs once per `sync_interval`.
+    //     Up to `sync_interval` of acked work can be lost on crash — same
+    //     contract as pre-Phase-8.
     let engine_handle = tokio::spawn(async move {
         let mut tick_interval = tokio::time::interval(tick_period);
         let mut sigusr1 =
@@ -3388,26 +3408,42 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                 msg = engine_rx.recv() => {
                     let Some(msg) = msg else { break };
 
+                    let strict = state
+                        .wal_sync_interval()
+                        .is_some_and(|i| i.is_zero());
+
                     let mut shutdown_seen =
                         process_message(&mut state, msg, &mut pending) == ProcessResult::Shutdown;
 
-                    // Drain any other ready messages without yielding so we
-                    // amortise the next fsync across the whole burst.
-                    while !shutdown_seen && pending.len() < MAX_BATCH {
-                        let next = match engine_rx.try_recv() {
-                            Ok(m) => m,
-                            Err(_) => break,
-                        };
-                        shutdown_seen =
-                            process_message(&mut state, next, &mut pending) == ProcessResult::Shutdown;
+                    if strict {
+                        // Group commit: drain non-blocking up to MAX_BATCH
+                        // so one fsync amortises across the whole burst.
+                        // Relaxed mode skips this — process_message already
+                        // sent the ack as Immediate, and a drain loop here
+                        // would starve per-connection tasks waiting to
+                        // deliver those acks (every iteration is sync).
+                        while !shutdown_seen && pending.len() < MAX_BATCH {
+                            let next = match engine_rx.try_recv() {
+                                Ok(m) => m,
+                                Err(_) => break,
+                            };
+                            shutdown_seen = process_message(&mut state, next, &mut pending)
+                                == ProcessResult::Shutdown;
+                        }
+                        // sync_interval == 0: pending acks must wait for
+                        // fsync to complete before going out. One fsync,
+                        // then drain the deferred acks.
+                        if !pending.is_empty() {
+                            if state.wal_is_dirty() {
+                                state.sync_wal();
+                            }
+                            drain_pending(&mut pending);
+                        }
                     }
-
-                    // Single fsync covering every WAL/TOAST mutation in this
-                    // burst, then drain the deferred acks.
-                    if state.wal_is_dirty() {
-                        state.sync_wal();
-                    }
-                    drain_pending(&mut pending);
+                    // Relaxed (sync_interval > 0): the ack went out inside
+                    // process_message via DispatchOutcome::Immediate; the
+                    // tick branch will fsync buffered WAL/TOAST bytes
+                    // within the configured interval.
 
                     if shutdown_seen {
                         tracing::info!("engine shutting down, flushing WAL");
