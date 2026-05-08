@@ -3202,7 +3202,8 @@ pub async fn run_with_listener_limited(
 /// Test-only: same as [`run_with_listener`] but with `--sync-interval 0`,
 /// so the group-commit hot path runs at strictest durability. Used by the
 /// throughput test to verify that batching keeps the ceiling well above
-/// the per-put-fsync ceiling we'd see without it.
+/// the per-put-fsync ceiling we'd see without it. Same generous default
+/// disk budget as `run_with_listener` — production callers must pick one.
 pub async fn run_with_listener_sync_zero(
     listener: TcpListener,
     max_job_size: u32,
@@ -3211,7 +3212,7 @@ pub async fn run_with_listener_sync_zero(
     let state = build_state(
         max_job_size,
         None,
-        None,
+        Some(1024 * 1024 * 1024),
         Some(wal_dir),
         Duration::ZERO,
         true,
