@@ -2809,18 +2809,24 @@ impl ServerState {
         self.jobs.get(&id).map_or(0, |j| j.priority)
     }
 
-    /// Group commit: true iff the WAL has buffered writes that haven't been
-    /// fsynced. The engine drains its channel, then if dirty, calls
-    /// `sync_wal()` once to cover the whole batch. False when persistence
-    /// is disabled (no WAL to sync).
+    /// True iff the WAL has buffered writes since its last successful sync.
+    /// Drives the engine's group-commit decisions; see the `serve` loop banner.
     fn wal_is_dirty(&self) -> bool {
         self.wal.as_ref().is_some_and(|w| w.is_dirty())
     }
 
-    /// fsync TOAST then WAL, covering every write since the last sync.
-    /// Mirrors the existing `wal_write_*` failure pattern: an error
-    /// disables the WAL so the rest of the engine keeps running on
-    /// in-memory state, with a logged warning.
+    /// True iff the WAL is configured for strict durability (sync_interval
+    /// == 0). Computed once per recv arm; threaded into `dispatch_command`
+    /// to decide Pending vs Immediate without re-reading state.
+    fn wal_is_strict(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(|w| w.sync_interval().is_zero())
+    }
+
+    /// fsync TOAST then WAL. Disables the WAL on error (logged) so the
+    /// rest of the engine keeps serving in-memory state — same failure
+    /// shape as the existing `wal_write_*` helpers.
     fn sync_wal(&mut self) {
         if let Some(wal) = self.wal.as_mut()
             && let Err(e) = wal.sync()
@@ -2830,17 +2836,15 @@ impl ServerState {
         }
     }
 
-    /// Configured ack-staleness SLA, or `None` when persistence is off.
-    /// Engine compares this against `wal_last_sync_elapsed` in the tick
-    /// branch to decide whether to fire a backstop sync.
-    fn wal_sync_interval(&self) -> Option<Duration> {
-        self.wal.as_ref().map(|w| w.sync_interval())
-    }
-
-    /// Time since the WAL's last successful sync, or `None` when
-    /// persistence is off.
-    fn wal_last_sync_elapsed(&self) -> Option<Duration> {
-        self.wal.as_ref().map(|w| w.last_sync_elapsed())
+    /// True iff the WAL is dirty AND its sync-staleness SLA has elapsed.
+    /// Tick-branch backstop predicate; reads the WAL exactly once.
+    fn wal_sync_due(&self) -> bool {
+        let Some(wal) = self.wal.as_ref() else { return false };
+        if !wal.is_dirty() {
+            return false;
+        }
+        let interval = wal.sync_interval();
+        interval.is_zero() || wal.last_sync_elapsed() >= interval
     }
 
     fn wal_write_put(&mut self, job_id: u64) {
@@ -3230,35 +3234,35 @@ enum ProcessResult {
 ///   pre-Phase-8 default behaviour and the throughput operators expect.
 fn dispatch_command(
     state: &mut ServerState,
+    strict: bool,
     conn_id: u64,
     cmd: Command,
     body: Option<Vec<u8>>,
     reply_tx: oneshot::Sender<Response>,
 ) -> DispatchOutcome {
-    let is_reserve = matches!(
-        cmd,
-        Command::Reserve | Command::ReserveWithTimeout { .. }
-    );
+    // Single match decides both is-this-a-reserve and what timeout was set.
+    // `Some(None)` = infinite-wait Reserve; `Some(Some(t))` = with timeout;
+    // `None` = not a reserve at all.
     let timeout = match &cmd {
-        Command::ReserveWithTimeout { timeout } => Some(*timeout),
-        Command::Reserve => None,
+        Command::Reserve => Some(None),
+        Command::ReserveWithTimeout { timeout } => Some(Some(*timeout)),
         _ => None,
     };
 
     let resp = state.handle_command(conn_id, cmd, body);
 
-    // Reserve with no available job — park onto waiter list rather than
-    // ack TimedOut. The reply_tx travels with the waiter; it'll fire when
-    // a put wakes the waiter (after that put's sync) or on timeout.
-    if is_reserve && matches!(resp, Response::TimedOut) && timeout != Some(0) {
-        let deadline = timeout.map(|t| Instant::now() + Duration::from_secs(t as u64));
+    // Reserve with no available job — park onto the waiter list rather
+    // than ack TimedOut. The reply_tx travels with the waiter; it'll fire
+    // when a put wakes the waiter (after that put's sync) or on timeout.
+    if let Some(t) = timeout
+        && matches!(resp, Response::TimedOut)
+        && t != Some(0)
+    {
+        let deadline = t.map(|secs| Instant::now() + Duration::from_secs(secs as u64));
         state.add_waiter(conn_id, reply_tx, deadline);
         return DispatchOutcome::Deferred;
     }
 
-    let strict = state
-        .wal_sync_interval()
-        .is_some_and(|i| i.is_zero());
     if strict && state.wal_is_dirty() {
         DispatchOutcome::Pending(reply_tx, resp)
     } else {
@@ -3271,12 +3275,13 @@ fn dispatch_command(
 /// a reply.
 fn process_message(
     state: &mut ServerState,
+    strict: bool,
     msg: EngineMsg,
     pending: &mut Vec<(oneshot::Sender<Response>, Response)>,
 ) -> ProcessResult {
     match msg.payload {
         EnginePayload::Command { cmd, body, reply_tx } => {
-            match dispatch_command(state, msg.conn_id, cmd, body, reply_tx) {
+            match dispatch_command(state, strict, msg.conn_id, cmd, body, reply_tx) {
                 DispatchOutcome::Pending(tx, r) => pending.push((tx, r)),
                 DispatchOutcome::Immediate(tx, r) => {
                     let _ = tx.send(r);
@@ -3408,42 +3413,40 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                 msg = engine_rx.recv() => {
                     let Some(msg) = msg else { break };
 
-                    let strict = state
-                        .wal_sync_interval()
-                        .is_some_and(|i| i.is_zero());
+                    // Computed once per recv arm and threaded through so
+                    // dispatch_command doesn't have to re-read the WAL.
+                    let strict = state.wal_is_strict();
 
                     let mut shutdown_seen =
-                        process_message(&mut state, msg, &mut pending) == ProcessResult::Shutdown;
+                        process_message(&mut state, strict, msg, &mut pending) == ProcessResult::Shutdown;
 
                     if strict {
                         // Group commit: drain non-blocking up to MAX_BATCH
                         // so one fsync amortises across the whole burst.
-                        // Relaxed mode skips this — process_message already
-                        // sent the ack as Immediate, and a drain loop here
-                        // would starve per-connection tasks waiting to
-                        // deliver those acks (every iteration is sync).
+                        // Relaxed mode (sync_interval > 0) skips this —
+                        // process_message already sent the ack as Immediate,
+                        // and a drain loop here would starve per-connection
+                        // tasks waiting to deliver those acks. (Removing
+                        // this gate causes a 50× throughput regression at
+                        // sync_interval > 0; see docs/architecture.md.)
                         while !shutdown_seen && pending.len() < MAX_BATCH {
                             let next = match engine_rx.try_recv() {
                                 Ok(m) => m,
                                 Err(_) => break,
                             };
-                            shutdown_seen = process_message(&mut state, next, &mut pending)
-                                == ProcessResult::Shutdown;
+                            shutdown_seen =
+                                process_message(&mut state, strict, next, &mut pending)
+                                    == ProcessResult::Shutdown;
                         }
-                        // sync_interval == 0: pending acks must wait for
-                        // fsync to complete before going out. One fsync,
-                        // then drain the deferred acks.
+                        // pending non-empty implies the WAL is dirty (we
+                        // only push Pending when it is). sync_wal() is also
+                        // a no-op on a clean WAL, so an extra check would
+                        // be redundant.
                         if !pending.is_empty() {
-                            if state.wal_is_dirty() {
-                                state.sync_wal();
-                            }
+                            state.sync_wal();
                             drain_pending(&mut pending);
                         }
                     }
-                    // Relaxed (sync_interval > 0): the ack went out inside
-                    // process_message via DispatchOutcome::Immediate; the
-                    // tick branch will fsync buffered WAL/TOAST bytes
-                    // within the configured interval.
 
                     if shutdown_seen {
                         tracing::info!("engine shutting down, flushing WAL");
@@ -3455,20 +3458,12 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                 }
                 _ = tick_interval.tick() => {
                     state.tick();
-                    // SLA backstop: state.tick() can dirty the WAL via TTR
-                    // expiry. Sync if dirty AND the configured interval has
-                    // elapsed (or interval is zero — no SLA, sync ASAP).
-                    if state.wal_is_dirty() {
-                        let due = state
-                            .wal_sync_interval()
-                            .zip(state.wal_last_sync_elapsed())
-                            .is_some_and(|(int, el)| int.is_zero() || el >= int);
-                        if due {
-                            state.sync_wal();
-                        }
+                    // SLA backstop. state.tick() can dirty the WAL via TTR
+                    // expiry; pending is always empty here because the recv
+                    // arm flushes its own before yielding.
+                    if state.wal_sync_due() {
+                        state.sync_wal();
                     }
-                    // pending is empty here by construction — every recv
-                    // arm flushes its own pending before yielding.
                 }
                 _ = sigusr1.recv() => {
                     tracing::info!("received SIGUSR1, entering drain mode");

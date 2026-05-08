@@ -642,11 +642,8 @@ pub struct Wal {
     /// incrementally so `total_disk_bytes()` is O(1) on the put hot path.
     total_disk_bytes: u64,
     records_migrated: u64,
-    /// True iff there are buffered writes since the last `sync()`. The
-    /// engine task drains its channel and then calls `sync_wal` once per
-    /// burst, amortising the fsync cost across every write that landed
-    /// during the drain (group commit). Set inside `write_put` /
-    /// `write_state_change`; cleared inside `sync_inner`.
+    /// True iff there are buffered writes since the last `sync()`. Set on
+    /// every `write_put` / `write_state_change`; cleared by `sync()`.
     dirty: bool,
     /// External body store. When present, every WAL fsync is preceded by a
     /// body-store fsync so that any `BodyId` referenced by an acked WAL
@@ -783,30 +780,22 @@ impl Wal {
     }
 
     /// True iff there are buffered writes since the last successful sync.
-    /// Engine calls this after dispatching a command to decide whether to
-    /// defer the ack into the pending list.
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
-    /// Time since the last successful fsync. Drives the tick-driven SLA
-    /// backstop in the engine.
+    /// Time since the last successful fsync.
     pub fn last_sync_elapsed(&self) -> Duration {
         self.last_sync_at.elapsed()
     }
 
-    /// Group-commit sync: fsync TOAST then WAL, mark clean. No-op when
-    /// nothing has been written since the last sync.
+    /// fsync TOAST then WAL; clear `dirty`. No-op on a clean WAL — safe to
+    /// call from both group-commit hot paths (skip the syscalls when
+    /// nothing's buffered) and shutdown (where being clean is fine).
     pub fn sync(&mut self) -> io::Result<()> {
         if !self.dirty {
             return Ok(());
         }
-        self.sync_inner()
-    }
-
-    /// Unconditional fsync of TOAST then WAL. Used by `flush_and_sync`
-    /// (shutdown) where we always want to flush, dirty flag or not.
-    fn sync_inner(&mut self) -> io::Result<()> {
         self.pre_sync_body_store()?;
         if let Some(f) = self.files.back_mut()
             && let Some(fd) = f.fd.as_mut()
@@ -1326,11 +1315,10 @@ impl Wal {
         }
     }
 
-    /// Flush the userland buffer and fsync the current file unconditionally.
-    /// Used on shutdown to guarantee the buffered tail reaches disk regardless
-    /// of the dirty flag — this is the last gasp before the engine exits.
+    /// Last-gasp sync on shutdown. Same body as `sync()`; the wrapper exists
+    /// so the engine's shutdown path doesn't need to plumb a `Result`.
     pub fn flush_and_sync(&mut self) {
-        if let Err(e) = self.sync_inner() {
+        if let Err(e) = self.sync() {
             tracing::warn!("WAL flush_and_sync: {}", e);
         }
     }
