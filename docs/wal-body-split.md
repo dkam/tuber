@@ -68,7 +68,7 @@ Implementation summary
 
 New BodyStore module managing TOAST segments, in-memory BodyId → BodyLocation index, segment headers with checksums, free-space tracking, compaction.
 Job.body: Vec<u8> → Job.body: BodyRef (enum of Inline | External(BodyId)).
-WAL FullJob record format: replace inline body bytes with BodyId reference. Bump WAL version (v3 → v4).
+WAL FullJob record format: replace inline body bytes with BodyId reference. Bump WAL version (v3 → v5; v4 was an earlier intermediate that added a `reason` byte to StateChange records, kept readable for backward compatibility).
 Startup recovery: WAL replay rebuilds metadata, TOAST header scan rebuilds body index.
 Put path: assign BodyId, write body to TOAST, write WAL record with BodyId, sync both on next tick, ack on sync.
 Reserve path: lookup BodyId in index, positioned read against segment, send to client.
