@@ -335,7 +335,19 @@ impl ServerState {
                 match bs.read_body(*id) {
                     Ok(bytes) => Some(bytes),
                     Err(e) => {
-                        tracing::error!(body_id = id.0, "TOAST read failed: {}", e);
+                        // Structured fields so an alert on these errors
+                        // can be correlated back to the job, tube, and
+                        // job state. The body_id alone isn't enough —
+                        // operators trying to triage need to know which
+                        // tube is poisoned and what state the job's in.
+                        tracing::error!(
+                            job_id = job.id,
+                            body_id = id.0,
+                            tube = %job.tube_name,
+                            state = job.state.as_str(),
+                            error = %e,
+                            "TOAST read failed",
+                        );
                         None
                     }
                 }
