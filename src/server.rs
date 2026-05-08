@@ -121,6 +121,14 @@ struct GlobalStats {
     /// `compact_segment`). One-shot value set during `build_state`.
     /// Every nonzero value indicates lost data — alert on it.
     recovered_missing_bodies: u64,
+    /// TOAST bodies reclaimed at startup because the WAL records their
+    /// owning job as deleted but the pre-WAL-fsync `BodyStore::delete`
+    /// never landed (server crashed between WAL fsync and TOAST cleanup).
+    /// One-shot value set during `build_state`. Routine — small steady-
+    /// state numbers indicate the reclamation path is working. A *large*
+    /// jump after a crash is informational; a steady upward trend across
+    /// clean restarts would suggest a leak in the runtime delete path.
+    reclaimed_orphan_bodies: u64,
 }
 
 /// State for a job group (grp:/aft: feature).
@@ -2381,6 +2389,7 @@ impl ServerState {
              toast-bodies-migrated-total: {}\n\
              toast-bodies-dropped-corrupted: {}\n\
              recovered-missing-bodies: {}\n\
+             reclaimed-orphan-bodies: {}\n\
              max-storage-bytes: {}\n\
              current-concurrency-keys: {}\n\
              draining: {}\n\
@@ -2450,6 +2459,7 @@ impl ServerState {
             toast_bodies_migrated_total,
             toast_bodies_dropped_corrupted,
             self.stats.recovered_missing_bodies,
+            self.stats.reclaimed_orphan_bodies,
             self.max_storage_bytes.unwrap_or(0),
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
@@ -3027,6 +3037,7 @@ fn build_state(
         // between WAL fsync and TOAST cleanup). Without this, orphans
         // accumulate on disk indefinitely.
         if !orphan_bodies.is_empty() {
+            state.stats.reclaimed_orphan_bodies = orphan_bodies.len() as u64;
             body_store.delete_many(&orphan_bodies);
             tracing::info!(
                 "WAL replay: reclaimed {} orphan TOAST bodies",

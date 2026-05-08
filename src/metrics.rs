@@ -302,6 +302,17 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         &stats,
         "recovered-missing-bodies",
     );
+    prom_counter(
+        &mut out,
+        "tuber_reclaimed_orphan_bodies_total",
+        "TOAST bodies reclaimed at startup whose owning job was deleted \
+         in the WAL but whose runtime BodyStore::delete didn't land before \
+         the crash. Routine — small numbers indicate the reclamation path \
+         is working. Alert on a sustained upward trend across clean \
+         restarts (suggests a leak in the runtime delete path).",
+        &stats,
+        "reclaimed-orphan-bodies",
+    );
 
     // Command counters (labeled)
     let cmd_keys = [
