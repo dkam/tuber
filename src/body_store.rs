@@ -24,7 +24,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::job::BodyId;
@@ -135,6 +135,10 @@ pub struct BodyStore {
     total_bytes: AtomicU64,
     /// Sum of body bytes still referenced. Compaction trigger.
     live_bytes: AtomicU64,
+    /// Count of segment files currently on disk. Mirrors `Inner.segments.len()`
+    /// but readable lock-free so the stats / Prometheus paths don't acquire
+    /// the inner mutex on every poll.
+    segment_count: AtomicUsize,
     /// Number of `compact_segment` calls that ran to completion (including
     /// no-op compactions of empty segments). Surfaced via `stats`.
     compactions_total: AtomicU64,
@@ -198,12 +202,14 @@ impl BodyStore {
         let next_seq = seqs.last().map(|s| s + 1).unwrap_or(0);
         let current_seq = seqs.last().copied();
 
+        let segment_count = segments.len();
         Ok(BodyStore {
             dir: dir.to_path_buf(),
             segment_size,
             next_body_id: AtomicU64::new(max_body_id),
             total_bytes: AtomicU64::new(total_bytes_acc),
             live_bytes: AtomicU64::new(live_bytes_acc),
+            segment_count: AtomicUsize::new(segment_count),
             compactions_total: AtomicU64::new(0),
             bodies_migrated_total: AtomicU64::new(0),
             inner: Mutex::new(Inner { segments, current_seq, next_seq, index }),
@@ -250,6 +256,7 @@ impl BodyStore {
             inner.rotate(&self.dir)?;
             self.total_bytes
                 .fetch_add(FILE_HEADER_SIZE as u64, Ordering::Relaxed);
+            self.segment_count.fetch_add(1, Ordering::Relaxed);
         }
 
         let current_seq = inner.current_seq.expect("rotation populates current_seq");
@@ -382,10 +389,9 @@ impl BodyStore {
         self.live_bytes.load(Ordering::Relaxed)
     }
 
-    /// Number of segments currently on disk.
+    /// Number of segments currently on disk. Lock-free read.
     pub fn segment_count(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
-        inner.segments.len()
+        self.segment_count.load(Ordering::Relaxed)
     }
 
     /// Number of `compact_segment` calls completed since startup.
@@ -500,6 +506,7 @@ impl BodyStore {
         };
         self.total_bytes
             .fetch_sub(segment_total, Ordering::Relaxed);
+        self.segment_count.fetch_sub(1, Ordering::Relaxed);
         let _ = std::fs::remove_file(&path);
 
         self.compactions_total.fetch_add(1, Ordering::Relaxed);

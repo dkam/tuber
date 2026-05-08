@@ -127,6 +127,30 @@ impl TestServer {
         })
     }
 
+    /// Start with `--sync-interval 0` (strictest durability). Used by the
+    /// group-commit throughput test — verifies batching keeps the ceiling
+    /// well above the per-put-fsync floor.
+    async fn start_with_wal_sync_zero(dir: &Path) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let wal_dir = dir.to_path_buf();
+        let wal_dir_clone = wal_dir.clone();
+
+        let handle = tokio::spawn(async move {
+            tuber::server::run_with_listener_sync_zero(listener, 65535, wal_dir_clone.as_path())
+                .await
+                .ok();
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        TestServer {
+            port,
+            handle,
+            wal_dir,
+        }
+    }
+
     /// Try to start with a specific `migrate_wal` setting, surfacing the
     /// startup error if any. Used by the legacy-WAL refusal tests.
     async fn try_start_with_migrate_wal(
@@ -1271,4 +1295,139 @@ async fn test_migrate_flag_is_noop_on_current_format_wal() {
     c.mustsend("peek 1\r\n").await;
     c.ckresp("FOUND 1 5\r\n").await;
     c.ckresp("hello\r\n").await;
+}
+
+/// Group commit: at `--sync-interval 0`, 8 concurrent producers each
+/// issuing 50 puts must complete well above the per-put-fsync floor.
+///
+/// Pre-change baseline (per-put fsync): ~75 puts/sec ceiling regardless
+/// of producer count, since the engine task serialises and each put pays
+/// its own fsync. Post-change one fsync per drained batch covers all 8
+/// producers' in-flight puts → hundreds of puts/sec on isolated runs.
+///
+/// Threshold of 90 ops/sec is set with `cargo test`'s parallelism in mind
+/// — the full suite shares SSD fsync bandwidth across ~30 tests, so the
+/// observed rate drops well below the standalone number. 90 still sits
+/// meaningfully above the per-put-fsync ceiling and would catch a
+/// regression that broke batching (which would then run *below* baseline
+/// because it's competing with the rest of the suite for fsync slots).
+#[tokio::test]
+async fn test_group_commit_throughput_at_sync_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = TestServer::start_with_wal_sync_zero(dir.path()).await;
+
+    const PRODUCERS: usize = 8;
+    const PUTS_EACH: usize = 50;
+    const TOTAL: usize = PRODUCERS * PUTS_EACH;
+
+    let port = srv.port;
+    let started = std::time::Instant::now();
+
+    let mut handles = Vec::with_capacity(PRODUCERS);
+    for _ in 0..PRODUCERS {
+        handles.push(tokio::spawn(async move {
+            let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let (reader, writer) = stream.into_split();
+            let mut c = TestConn {
+                reader: BufReader::new(reader),
+                writer,
+            };
+            for _ in 0..PUTS_EACH {
+                c.mustsend("put 0 0 60 5\r\nhello\r\n").await;
+                let line = c.readline().await;
+                assert!(
+                    line.starts_with("INSERTED "),
+                    "unexpected response: {:?}",
+                    line
+                );
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let elapsed = started.elapsed();
+    let ops_per_sec = TOTAL as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "group-commit throughput: {} puts in {:?} ({:.1} ops/sec)",
+        TOTAL, elapsed, ops_per_sec
+    );
+    assert!(
+        ops_per_sec >= 90.0,
+        "throughput regressed below the group-commit floor: \
+         {:.1} ops/sec (≥ 90 expected); per-put-fsync baseline is ~75 \
+         on a single producer and falls further under suite parallelism",
+        ops_per_sec
+    );
+
+    // The whole batch must round-trip: after the producers finish, the
+    // queue holds exactly TOTAL ready jobs, and they're all reservable.
+    let mut c = srv.connect().await;
+    c.mustsend("stats-tube default\r\n").await;
+    let header = c.readline().await;
+    assert!(header.starts_with("OK "));
+    // Drain the OK body — we don't parse it, the assertion below covers it.
+    let body_len: usize = header
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap();
+    let mut body = vec![0u8; body_len];
+    use tokio::io::AsyncReadExt;
+    c.reader.read_exact(&mut body).await.unwrap();
+    let mut crlf = [0u8; 2];
+    c.reader.read_exact(&mut crlf).await.unwrap();
+    let yaml = String::from_utf8(body).unwrap();
+    let ready_line = yaml
+        .lines()
+        .find(|l| l.starts_with("current-jobs-ready:"))
+        .expect("ready count present");
+    let ready: usize = ready_line
+        .split(':')
+        .nth(1)
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap();
+    assert_eq!(ready, TOTAL, "every put must be persisted and ready");
+}
+
+/// Group commit must preserve durability through restart: every job that
+/// got an `INSERTED` ack at sync_interval=0 survives a clean shutdown.
+/// Crash-recovery under `kill -9` is covered at the integration level by
+/// `tuber-pressure-testing/ruby/bin/crash_recover.rb`; this test locks in
+/// the in-process clean-shutdown invariant.
+#[tokio::test]
+async fn test_group_commit_durability_clean_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let acked: Vec<u64> = {
+        let srv = TestServer::start_with_wal_sync_zero(dir.path()).await;
+        let mut c = srv.connect().await;
+        let mut ids = Vec::with_capacity(40);
+        for _ in 0..40 {
+            c.mustsend("put 0 0 60 7\r\npayload\r\n").await;
+            let line = c.readline().await;
+            // Parse "INSERTED <id>\r\n"
+            let id: u64 = line
+                .strip_prefix("INSERTED ")
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or_else(|| panic!("unexpected: {:?}", line));
+            ids.push(id);
+        }
+        drop(c);
+        let _ = srv.shutdown();
+        // Allow the engine to flush+sync on shutdown.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ids
+    };
+
+    // Restart against the same dir; every acked id must replay.
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+    for id in &acked {
+        c.mustsend(&format!("peek {}\r\n", id)).await;
+        c.ckresp(&format!("FOUND {} 7\r\n", id)).await;
+        c.ckresp("payload\r\n").await;
+    }
 }

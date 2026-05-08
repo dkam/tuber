@@ -917,11 +917,17 @@ impl ServerState {
                 &concurrency_key,
             );
             if !wal.reserve_put(est_size) {
+                // The record (mostly metadata after Phase 3 — bodies live in
+                // TOAST) is bigger than a single WAL segment can hold, so it
+                // can never be journalled. Return JOB_TOO_BIG: this is the
+                // existing semantic for "this individual record won't fit",
+                // and the operator's only fix is to raise the segment size
+                // or shrink whichever oversize field tipped the estimate.
                 tracing::warn!(
-                    "WAL: OUT_OF_MEMORY — job record ({est_size} bytes) exceeds max file size ({})",
+                    "WAL: record ({est_size} bytes) exceeds segment size ({}) — JOB_TOO_BIG",
                     wal.max_file_size(),
                 );
-                return Response::OutOfMemory;
+                return Response::JobTooBig;
             }
         }
 
@@ -1556,6 +1562,13 @@ impl ServerState {
         // WAL: write delete for each job, then drop them from the in-memory
         // map. Body releases are batched into a single BodyStore call so
         // flush-tube doesn't acquire/release the BodyStore mutex per job.
+        //
+        // Failure note: if `wal_write_state_change` fails mid-batch, the
+        // helper sets `self.wal = None` and the rest of the deletes proceed
+        // against memory only. Those deletes won't survive a crash. This
+        // is acceptable for a destructive command — flush-tube semantically
+        // throws data away, and the alternative (abort the flush partway)
+        // leaves the operator no clean recovery either.
         let mut external_bodies: Vec<BodyId> = Vec::new();
         for &id in &job_ids {
             self.wal_write_state_change(id, None, 0, Duration::ZERO, 0, StateChangeReason::None);
@@ -2796,6 +2809,40 @@ impl ServerState {
         self.jobs.get(&id).map_or(0, |j| j.priority)
     }
 
+    /// Group commit: true iff the WAL has buffered writes that haven't been
+    /// fsynced. The engine drains its channel, then if dirty, calls
+    /// `sync_wal()` once to cover the whole batch. False when persistence
+    /// is disabled (no WAL to sync).
+    fn wal_is_dirty(&self) -> bool {
+        self.wal.as_ref().is_some_and(|w| w.is_dirty())
+    }
+
+    /// fsync TOAST then WAL, covering every write since the last sync.
+    /// Mirrors the existing `wal_write_*` failure pattern: an error
+    /// disables the WAL so the rest of the engine keeps running on
+    /// in-memory state, with a logged warning.
+    fn sync_wal(&mut self) {
+        if let Some(wal) = self.wal.as_mut()
+            && let Err(e) = wal.sync()
+        {
+            tracing::error!("WAL sync error: {}, disabling WAL", e);
+            self.wal = None;
+        }
+    }
+
+    /// Configured ack-staleness SLA, or `None` when persistence is off.
+    /// Engine compares this against `wal_last_sync_elapsed` in the tick
+    /// branch to decide whether to fire a backstop sync.
+    fn wal_sync_interval(&self) -> Option<Duration> {
+        self.wal.as_ref().map(|w| w.sync_interval())
+    }
+
+    /// Time since the WAL's last successful sync, or `None` when
+    /// persistence is off.
+    fn wal_last_sync_elapsed(&self) -> Option<Duration> {
+        self.wal.as_ref().map(|w| w.last_sync_elapsed())
+    }
+
     fn wal_write_put(&mut self, job_id: u64) {
         if self.wal.is_none() {
             return;
@@ -2901,21 +2948,20 @@ fn build_state(
         // replay path lifts into the body store. We refuse to migrate
         // silently — operators who haven't reasoned about the upgrade
         // should hit a clear stop sign before any data is touched.
-        if let Some(min_version) = wal.min_format_version()?
-            && min_version < crate::wal::WAL_VERSION
-            && !migrate_wal
-        {
-            return Err(io::Error::other(format!(
-                "WAL contains v{min_version} records, but this binary writes \
-                 v{}. Re-run with --migrate-wal to convert (inline bodies are \
-                 promoted into TOAST). Back up {dir:?} first if you want a \
-                 rollback option.",
-                crate::wal::WAL_VERSION,
-            )));
-        }
-        if let Some(min_version) = wal.min_format_version()?
-            && min_version < crate::wal::WAL_VERSION
-        {
+        let legacy_version = wal
+            .min_format_version()?
+            .filter(|v| *v < crate::wal::WAL_VERSION);
+        if let Some(min_version) = legacy_version {
+            if !migrate_wal {
+                return Err(io::Error::other(format!(
+                    "WAL contains v{min_version} records, but this binary writes \
+                     v{}. Re-run with --migrate-wal to convert (inline bodies are \
+                     promoted into TOAST). Back up {} first if you want a \
+                     rollback option.",
+                    crate::wal::WAL_VERSION,
+                    dir.display(),
+                )));
+            }
             tracing::info!(
                 "WAL legacy format detected (v{} → v{}); migrating via --migrate-wal",
                 min_version,
@@ -3123,6 +3169,126 @@ pub async fn run_with_listener_limited(
     serve(listener, state, max_job_size).await
 }
 
+/// Test-only: same as [`run_with_listener`] but with `--sync-interval 0`,
+/// so the group-commit hot path runs at strictest durability. Used by the
+/// throughput test to verify that batching keeps the ceiling well above
+/// the per-put-fsync ceiling we'd see without it.
+pub async fn run_with_listener_sync_zero(
+    listener: TcpListener,
+    max_job_size: u32,
+    wal_dir: &Path,
+) -> io::Result<()> {
+    let state = build_state(
+        max_job_size,
+        None,
+        None,
+        Some(wal_dir),
+        Duration::ZERO,
+        true,
+        None,
+    )?;
+    serve(listener, state, max_job_size).await
+}
+
+/// Maximum number of acks the engine will buffer before forcing a sync.
+/// Channel is 1024; cap at half so the drain loop doesn't monopolise the
+/// task and the tail of a fully-loaded batch sees ≤ one fsync of latency.
+const MAX_BATCH: usize = 512;
+
+/// Result of dispatching a single command. Drives the engine's group-commit
+/// decision: should the response go out now, defer until the next sync, or
+/// disappear entirely (because a reserve queued onto the waiter list)?
+enum DispatchOutcome {
+    /// Command dirtied the WAL — defer the ack into `pending` so a single
+    /// fsync at the end of the drain covers every write in the batch.
+    Pending(oneshot::Sender<Response>, Response),
+    /// Read-only command; ack immediately.
+    Immediate(oneshot::Sender<Response>, Response),
+    /// Reserve with no available job parked onto the waiter list. Reply
+    /// will be sent later by `process_queue` (post-sync) or the tick.
+    Deferred,
+}
+
+#[derive(PartialEq, Eq)]
+enum ProcessResult {
+    Continue,
+    Shutdown,
+}
+
+/// Run a single Command through `state.handle_command` and classify the
+/// outcome. Reserve-with-timeout that returns `TimedOut` is bounced onto
+/// the waiter list (reply held by the waiter, returns `Deferred`); every
+/// other path inspects `wal_is_dirty()` to decide Pending vs. Immediate.
+fn dispatch_command(
+    state: &mut ServerState,
+    conn_id: u64,
+    cmd: Command,
+    body: Option<Vec<u8>>,
+    reply_tx: oneshot::Sender<Response>,
+) -> DispatchOutcome {
+    let is_reserve = matches!(
+        cmd,
+        Command::Reserve | Command::ReserveWithTimeout { .. }
+    );
+    let timeout = match &cmd {
+        Command::ReserveWithTimeout { timeout } => Some(*timeout),
+        Command::Reserve => None,
+        _ => None,
+    };
+
+    let resp = state.handle_command(conn_id, cmd, body);
+
+    // Reserve with no available job — park onto waiter list rather than
+    // ack TimedOut. The reply_tx travels with the waiter; it'll fire when
+    // a put wakes the waiter (after that put's sync) or on timeout.
+    if is_reserve && matches!(resp, Response::TimedOut) && timeout != Some(0) {
+        let deadline = timeout.map(|t| Instant::now() + Duration::from_secs(t as u64));
+        state.add_waiter(conn_id, reply_tx, deadline);
+        return DispatchOutcome::Deferred;
+    }
+
+    if state.wal_is_dirty() {
+        DispatchOutcome::Pending(reply_tx, resp)
+    } else {
+        DispatchOutcome::Immediate(reply_tx, resp)
+    }
+}
+
+/// Process one engine message; classify into pending/immediate/deferred or
+/// signal Shutdown. Disconnects update connection state but never produce
+/// a reply.
+fn process_message(
+    state: &mut ServerState,
+    msg: EngineMsg,
+    pending: &mut Vec<(oneshot::Sender<Response>, Response)>,
+) -> ProcessResult {
+    match msg.payload {
+        EnginePayload::Command { cmd, body, reply_tx } => {
+            match dispatch_command(state, msg.conn_id, cmd, body, reply_tx) {
+                DispatchOutcome::Pending(tx, r) => pending.push((tx, r)),
+                DispatchOutcome::Immediate(tx, r) => {
+                    let _ = tx.send(r);
+                }
+                DispatchOutcome::Deferred => {}
+            }
+            ProcessResult::Continue
+        }
+        EnginePayload::Disconnect => {
+            state.unregister_conn(msg.conn_id);
+            ProcessResult::Continue
+        }
+        EnginePayload::Shutdown => ProcessResult::Shutdown,
+    }
+}
+
+/// Drain every deferred ack. Disconnected clients silently ignored —
+/// the WAL write is durable regardless of whether the client hears about it.
+fn drain_pending(pending: &mut Vec<(oneshot::Sender<Response>, Response)>) {
+    for (tx, r) in pending.drain(..) {
+        let _ = tx.send(r);
+    }
+}
+
 /// Run the engine task and accept loop with a fully-built [`ServerState`].
 async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32) -> io::Result<()> {
     let (engine_tx, mut engine_rx) = mpsc::channel::<EngineMsg>(1024);
@@ -3151,25 +3317,37 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                     ) else {
                         continue;
                     };
-                    // The compaction itself is synchronous file IO; on a 64 MiB
-                    // segment with a typical mix this is well under 100 ms,
-                    // shorter than a tick. Run inside the task and accept the
-                    // brief stall — `spawn_blocking` would only matter if we
-                    // expected multi-second compactions.
-                    match bs.compact_segment(seq) {
-                        Ok(n) if n > 0 => {
+                    // Compaction is synchronous file IO: pwrite + fsync per
+                    // body, plus an unlink at the end. On fast SSD with
+                    // typical bodies it's well under 100 ms, but on slow
+                    // storage (HDD/NAS), large bodies, or under CPU pressure
+                    // it can stall the runtime. Run on the blocking pool so
+                    // a slow compaction can't starve other tokio tasks.
+                    let bs_for_blocking = Arc::clone(&bs);
+                    let result = tokio::task::spawn_blocking(move || {
+                        bs_for_blocking.compact_segment(seq)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(n)) if n > 0 => {
                             tracing::info!(
                                 "TOAST compacted segment {}: migrated {} bodies",
                                 seq, n
                             );
                         }
-                        Ok(_) => {
+                        Ok(Ok(_)) => {
                             tracing::debug!("TOAST compacted segment {}: empty", seq);
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::error!(
                                 "TOAST compaction failed for segment {}: {}",
                                 seq, e
+                            );
+                        }
+                        Err(je) => {
+                            tracing::error!(
+                                "TOAST compaction task panicked on segment {}: {}",
+                                seq, je
                             );
                         }
                     }
@@ -3191,60 +3369,70 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
         .filter(|d| !d.is_zero() && *d < default_tick)
         .unwrap_or(default_tick);
 
-    // Engine task
+    // Engine task. Group commit shape:
+    //   1. Receive a message; dispatch it.
+    //   2. Drain the channel non-blocking up to MAX_BATCH.
+    //   3. If the batch dirtied the WAL, fsync once for the whole batch.
+    //   4. Send every deferred ack; clients see their responses only AFTER
+    //      sync, so the durability invariant — "ack ⇒ on disk" — holds.
     let engine_handle = tokio::spawn(async move {
         let mut tick_interval = tokio::time::interval(tick_period);
         let mut sigusr1 =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
                 .expect("failed to register SIGUSR1 handler");
+        let mut pending: Vec<(oneshot::Sender<Response>, Response)> =
+            Vec::with_capacity(MAX_BATCH);
 
         loop {
             tokio::select! {
                 msg = engine_rx.recv() => {
-                    let msg = match msg {
-                        Some(m) => m,
-                        None => break, // all senders dropped
-                    };
-                    match msg.payload {
-                        EnginePayload::Command { cmd, body, reply_tx } => {
-                            let is_reserve = matches!(cmd,
-                                Command::Reserve | Command::ReserveWithTimeout { .. }
-                            );
-                            let timeout = match &cmd {
-                                Command::ReserveWithTimeout { timeout } => Some(*timeout),
-                                Command::Reserve => None, // infinite wait
-                                _ => None,
-                            };
+                    let Some(msg) = msg else { break };
 
-                            let resp = state.handle_command(msg.conn_id, cmd, body);
+                    let mut shutdown_seen =
+                        process_message(&mut state, msg, &mut pending) == ProcessResult::Shutdown;
 
-                            // If reserve returned TimedOut but wasn't a timeout=0 request,
-                            // this means no job was available and we should wait.
-                            if is_reserve && matches!(resp, Response::TimedOut)
-                                && timeout != Some(0) {
-                                    let deadline = timeout.map(|t| {
-                                        Instant::now() + Duration::from_secs(t as u64)
-                                    });
-                                    state.add_waiter(msg.conn_id, reply_tx, deadline);
-                                    continue;
-                                }
+                    // Drain any other ready messages without yielding so we
+                    // amortise the next fsync across the whole burst.
+                    while !shutdown_seen && pending.len() < MAX_BATCH {
+                        let next = match engine_rx.try_recv() {
+                            Ok(m) => m,
+                            Err(_) => break,
+                        };
+                        shutdown_seen =
+                            process_message(&mut state, next, &mut pending) == ProcessResult::Shutdown;
+                    }
 
-                            let _ = reply_tx.send(resp);
+                    // Single fsync covering every WAL/TOAST mutation in this
+                    // burst, then drain the deferred acks.
+                    if state.wal_is_dirty() {
+                        state.sync_wal();
+                    }
+                    drain_pending(&mut pending);
+
+                    if shutdown_seen {
+                        tracing::info!("engine shutting down, flushing WAL");
+                        if let Some(wal) = &mut state.wal {
+                            wal.flush_and_sync();
                         }
-                        EnginePayload::Disconnect => {
-                            state.unregister_conn(msg.conn_id);
-                        }
-                        EnginePayload::Shutdown => {
-                            tracing::info!("engine shutting down, flushing WAL");
-                            if let Some(wal) = &mut state.wal {
-                                wal.flush_and_sync();
-                            }
-                            break;
-                        }
+                        break;
                     }
                 }
                 _ = tick_interval.tick() => {
                     state.tick();
+                    // SLA backstop: state.tick() can dirty the WAL via TTR
+                    // expiry. Sync if dirty AND the configured interval has
+                    // elapsed (or interval is zero — no SLA, sync ASAP).
+                    if state.wal_is_dirty() {
+                        let due = state
+                            .wal_sync_interval()
+                            .zip(state.wal_last_sync_elapsed())
+                            .is_some_and(|(int, el)| int.is_zero() || el >= int);
+                        if due {
+                            state.sync_wal();
+                        }
+                    }
+                    // pending is empty here by construction — every recv
+                    // arm flushes its own pending before yielding.
                 }
                 _ = sigusr1.recv() => {
                     tracing::info!("received SIGUSR1, entering drain mode");

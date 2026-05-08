@@ -642,6 +642,12 @@ pub struct Wal {
     /// incrementally so `total_disk_bytes()` is O(1) on the put hot path.
     total_disk_bytes: u64,
     records_migrated: u64,
+    /// True iff there are buffered writes since the last `sync()`. The
+    /// engine task drains its channel and then calls `sync_wal` once per
+    /// burst, amortising the fsync cost across every write that landed
+    /// during the drain (group commit). Set inside `write_put` /
+    /// `write_state_change`; cleared inside `sync_inner`.
+    dirty: bool,
     /// External body store. When present, every WAL fsync is preceded by a
     /// body-store fsync so that any `BodyId` referenced by an acked WAL
     /// record is already durable on disk.
@@ -755,6 +761,7 @@ impl Wal {
             alive_bytes: 0,
             total_disk_bytes: 0,
             records_migrated: 0,
+            dirty: false,
             body_store: None,
             lock_fd: Some(lock_fd),
             #[cfg(test)]
@@ -766,9 +773,49 @@ impl Wal {
         Ok(wal)
     }
 
-    /// Returns the configured fsync interval. `Duration::ZERO` means per-write.
+    /// Returns the configured fsync interval. After group commit, this
+    /// is the **maximum ack staleness SLA** — the engine drives sync via
+    /// `sync()` whenever its message channel drains, and the tick loop
+    /// uses this interval as a backstop. `Duration::ZERO` means "no SLA,
+    /// sync as soon as the channel is empty."
     pub fn sync_interval(&self) -> Duration {
         self.sync_interval
+    }
+
+    /// True iff there are buffered writes since the last successful sync.
+    /// Engine calls this after dispatching a command to decide whether to
+    /// defer the ack into the pending list.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Time since the last successful fsync. Drives the tick-driven SLA
+    /// backstop in the engine.
+    pub fn last_sync_elapsed(&self) -> Duration {
+        self.last_sync_at.elapsed()
+    }
+
+    /// Group-commit sync: fsync TOAST then WAL, mark clean. No-op when
+    /// nothing has been written since the last sync.
+    pub fn sync(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.sync_inner()
+    }
+
+    /// Unconditional fsync of TOAST then WAL. Used by `flush_and_sync`
+    /// (shutdown) where we always want to flush, dirty flag or not.
+    fn sync_inner(&mut self) -> io::Result<()> {
+        self.pre_sync_body_store()?;
+        if let Some(f) = self.files.back_mut()
+            && let Some(fd) = f.fd.as_mut()
+        {
+            Self::flush_and_fsync(fd)?;
+        }
+        self.record_sync();
+        self.dirty = false;
+        Ok(())
     }
 
     /// Attach a body store whose fsync must complete before any WAL fsync.
@@ -941,10 +988,9 @@ impl Wal {
         let record = serialize_full_job(job);
         let record_len = record.len();
 
-        let sync_per_write = self.sync_interval.is_zero();
-        if sync_per_write {
-            self.pre_sync_body_store()?;
-        }
+        // Group commit: bytes go into the BufWriter and `dirty` is set, but
+        // no fsync happens here. The engine task batches the fsync across
+        // every write that landed since the last sync.
         let file = self.current_file_mut()?;
         let fd = file
             .fd
@@ -952,9 +998,6 @@ impl Wal {
             .ok_or_else(|| io::Error::other("WAL file not open for writing"))?;
         fd.write_all(&record)?;
         file.bytes_written += record_len;
-        if sync_per_write {
-            Self::flush_and_fsync(fd)?;
-        }
         let file_seq = file.seq;
         self.total_disk_bytes += record_len as u64;
 
@@ -982,10 +1025,7 @@ impl Wal {
             self.reserved_bytes += STATE_CHANGE_RECORD_SIZE as u64;
         }
 
-        if sync_per_write {
-            self.record_sync();
-        }
-
+        self.dirty = true;
         Ok(())
     }
 
@@ -1011,10 +1051,8 @@ impl Wal {
         );
         let record_len = record.len();
 
-        let sync_per_write = self.sync_interval.is_zero();
-        if sync_per_write {
-            self.pre_sync_body_store()?;
-        }
+        // Group commit: writes go to the BufWriter and `dirty` is set, but
+        // no fsync until the engine drains its channel and calls sync().
         let file = self.current_file_mut()?;
         let fd = file
             .fd
@@ -1022,9 +1060,6 @@ impl Wal {
             .ok_or_else(|| io::Error::other("WAL file not open for writing"))?;
         fd.write_all(&record)?;
         file.bytes_written += record_len;
-        if sync_per_write {
-            Self::flush_and_fsync(fd)?;
-        }
         self.total_disk_bytes += record_len as u64;
 
         // Release reservation
@@ -1047,10 +1082,7 @@ impl Wal {
             // the FullJob's file, causing silent data loss on replay.
         }
 
-        if sync_per_write {
-            self.record_sync();
-        }
-
+        self.dirty = true;
         Ok(())
     }
 
@@ -1279,47 +1311,27 @@ impl Wal {
         }
     }
 
-    /// Run GC and, if the configured interval has elapsed, fsync the current file.
-    ///
-    /// The userland buffer is always flushed so that GC, stats, and replay see a
-    /// consistent view. The fsync itself is skipped when `sync_interval` is zero
-    /// (writes already synced inline) or when the interval has not yet elapsed.
+    /// Run GC and flush the BufWriter so that GC, stats, and replay see a
+    /// consistent view of pending bytes. Tick-driven sync now happens in
+    /// the engine task (see `serve()`'s tick branch and `ServerState::
+    /// sync_wal`); this method no longer fsyncs.
     pub fn maintain(&mut self) {
         self.gc();
-
-        // Decide up front whether we'll fsync this tick — pre-syncing TOAST
-        // requires self, but the file mut borrow below blocks that.
-        let will_sync =
-            !self.sync_interval.is_zero() && self.last_sync_at.elapsed() >= self.sync_interval;
-        if will_sync && let Err(e) = self.pre_sync_body_store() {
-            tracing::warn!("WAL maintain: TOAST fsync failed: {}", e);
-        }
-
         if let Some(f) = self.files.back_mut()
             && let Some(fd) = f.fd.as_mut()
         {
+            // Flush BufWriter into the file so subsequent reads (replay,
+            // stats) see a coherent view. fsync is the engine's job.
             let _ = fd.flush();
-
-            // Skip interval sync when interval=0 — writes already synced inline.
-            if will_sync {
-                let _ = fd.get_ref().sync_all();
-                self.record_sync();
-            }
         }
     }
 
     /// Flush the userland buffer and fsync the current file unconditionally.
     /// Used on shutdown to guarantee the buffered tail reaches disk regardless
-    /// of the configured sync interval.
+    /// of the dirty flag — this is the last gasp before the engine exits.
     pub fn flush_and_sync(&mut self) {
-        if let Err(e) = self.pre_sync_body_store() {
-            tracing::warn!("WAL flush_and_sync: TOAST fsync failed: {}", e);
-        }
-        if let Some(f) = self.files.back_mut()
-            && let Some(fd) = f.fd.as_mut()
-        {
-            let _ = Self::flush_and_fsync(fd);
-            self.record_sync();
+        if let Err(e) = self.sync_inner() {
+            tracing::warn!("WAL flush_and_sync: {}", e);
         }
     }
 
@@ -2469,7 +2481,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_interval_zero_syncs_per_write() {
+    fn test_writes_set_dirty_and_sync_clears_it() {
+        // Group commit invariant: writes buffer + set dirty; explicit
+        // sync() does the fsync and clears dirty. Multiple writes between
+        // syncs share a single fsync.
         let dir = tempfile::tempdir().unwrap();
         let mut wal = Wal::open(
             dir.path(),
@@ -2477,6 +2492,7 @@ mod tests {
         )
         .unwrap();
 
+        assert!(!wal.is_dirty(), "fresh WAL is clean");
         let baseline = wal.sync_count();
 
         let mut job1 = Job::new(
@@ -2509,12 +2525,37 @@ mod tests {
         )
         .unwrap();
 
-        // 3 writes × 1 sync each = 3 additional syncs.
-        assert_eq!(wal.sync_count() - baseline, 3);
+        // Writes do not fsync — dirty flag is the only signal.
+        assert!(wal.is_dirty(), "writes must mark WAL dirty");
+        assert_eq!(
+            wal.sync_count() - baseline,
+            0,
+            "writes must not trigger fsync"
+        );
+
+        // One sync covers all three writes.
+        wal.sync().unwrap();
+        assert!(!wal.is_dirty(), "sync() clears dirty");
+        assert_eq!(
+            wal.sync_count() - baseline,
+            1,
+            "one sync covers the whole batch"
+        );
+
+        // Calling sync() when clean is a no-op.
+        wal.sync().unwrap();
+        assert_eq!(
+            wal.sync_count() - baseline,
+            1,
+            "sync() on clean WAL must not fsync"
+        );
     }
 
     #[test]
-    fn test_sync_interval_positive_respects_interval() {
+    fn test_maintain_no_longer_fsyncs() {
+        // Tick-driven sync moved to the engine; maintain() just runs GC and
+        // flushes the BufWriter. Keep this test as a regression guard so
+        // future refactors don't accidentally re-introduce a fsync here.
         let dir = tempfile::tempdir().unwrap();
         let mut wal = Wal::open(
             dir.path(),
@@ -2522,8 +2563,6 @@ mod tests {
         )
         .unwrap();
 
-        // First write creates a file (which rotates from "no current file" and syncs
-        // the previous one — but there is none, so no sync on rotation). Write is buffered.
         let mut job = Job::new(
             1,
             10,
@@ -2534,30 +2573,24 @@ mod tests {
         );
         external_body(&mut job);
         wal.write_put(&mut job).unwrap();
-
         let baseline = wal.sync_count();
 
-        // Repeated maintain() calls well within the interval should not fsync.
         for _ in 0..5 {
             wal.maintain();
         }
         assert_eq!(
             wal.sync_count(),
             baseline,
-            "maintain must not sync before interval elapses"
+            "maintain must not fsync (engine owns sync now)"
         );
 
-        // Sleep past the interval and call maintain once — should sync exactly once.
+        // Even past the interval, maintain doesn't sync.
         std::thread::sleep(Duration::from_millis(550));
         wal.maintain();
-        assert_eq!(
-            wal.sync_count(),
-            baseline + 1,
-            "maintain must sync once after interval"
-        );
+        assert_eq!(wal.sync_count(), baseline);
 
-        // Immediately calling maintain again should not re-sync (interval reset).
-        wal.maintain();
+        // The engine's job: an explicit sync() is the only way bytes hit disk.
+        wal.sync().unwrap();
         assert_eq!(wal.sync_count(), baseline + 1);
     }
 
