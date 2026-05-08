@@ -146,6 +146,13 @@ pub struct BodyStore {
     /// Useful for spotting churn that's costing IO without freeing much
     /// disk.
     bodies_migrated_total: AtomicU64,
+    /// Number of bodies dropped during compaction because their CRC failed
+    /// to verify against the on-disk record. Bumped per-body, not per-
+    /// compaction. Every increment indicates real bit-rot — alert on
+    /// `rate(...) > 0`. The corresponding `BodyId` becomes unreadable
+    /// (subsequent reserve/peek returns NotFound, surfaced as
+    /// INTERNAL_ERROR by the server).
+    bodies_dropped_corrupted: AtomicU64,
     inner: Mutex<Inner>,
 }
 
@@ -212,6 +219,7 @@ impl BodyStore {
             segment_count: AtomicUsize::new(segment_count),
             compactions_total: AtomicU64::new(0),
             bodies_migrated_total: AtomicU64::new(0),
+            bodies_dropped_corrupted: AtomicU64::new(0),
             inner: Mutex::new(Inner { segments, current_seq, next_seq, index }),
         })
     }
@@ -404,6 +412,13 @@ impl BodyStore {
         self.bodies_migrated_total.load(Ordering::Relaxed)
     }
 
+    /// Number of bodies dropped during compaction due to CRC failure.
+    /// Every nonzero value means real bit-rot has happened on disk —
+    /// alert on it.
+    pub fn bodies_dropped_corrupted(&self) -> u64 {
+        self.bodies_dropped_corrupted.load(Ordering::Relaxed)
+    }
+
     /// Pick a sealed segment (i.e. not the one currently being appended to)
     /// whose live ratio has dropped below `threshold` (in [0.0, 1.0]). The
     /// most-wasted segment wins; ties go to the lowest seq. Returns `None`
@@ -444,6 +459,13 @@ impl BodyStore {
     /// compactor already moved the body, we skip and treat the freshly
     /// written copy as garbage that the next compaction will reclaim. A
     /// no-op for a non-existent or current segment.
+    ///
+    /// Corruption handling: when a body's on-disk CRC fails to verify, we
+    /// log loudly, drop the entry from the index, and continue — one
+    /// bit-rotted body must not block reclamation of an entire segment.
+    /// The dropped `BodyId` becomes unreadable (`reserve`/`peek` will
+    /// surface `INTERNAL_ERROR` to the client). Counted in
+    /// [`BodyStore::bodies_dropped_corrupted`].
     pub fn compact_segment(&self, seq: u64) -> Result<u64, BodyStoreError> {
         // Snapshot live bodies in this segment under the lock. The list is
         // immutable from here on; concurrent puts/deletes touch the index,
@@ -484,11 +506,21 @@ impl BodyStore {
             seg_file.read_exact_at(&mut buf, old_loc.offset)?;
             let found_crc = crc32fast::hash(&buf);
             if found_crc != expected_crc {
-                return Err(BodyStoreError::BadCrc {
-                    expected: expected_crc,
-                    found: found_crc,
-                    body_id,
-                });
+                // Bit-rot on disk. Drop this body from the index and keep
+                // going — failing the whole compaction would pin the
+                // entire segment indefinitely. Future reads of this
+                // BodyId will hit NotFound (surfaced as INTERNAL_ERROR).
+                tracing::error!(
+                    body_id = body_id.0,
+                    seq = old_loc.seq,
+                    offset = old_loc.offset,
+                    expected_crc = format!("{:08x}", expected_crc),
+                    found_crc = format!("{:08x}", found_crc),
+                    "TOAST corruption: dropping body during compaction",
+                );
+                self.delete(body_id);
+                self.bodies_dropped_corrupted.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
 
             if self.migrate_body(body_id, &buf, expected_crc, old_loc)? {
@@ -1018,5 +1050,57 @@ mod tests {
         drop(inner);
         assert_eq!(bs.compact_segment(current).unwrap(), 0);
         assert_eq!(bs.read_body(id).unwrap(), b"alive");
+    }
+
+    #[test]
+    fn compact_segment_skips_corrupted_bodies_and_continues() {
+        // One bit-rotted body must not block reclamation of the rest of
+        // the segment. The corrupted id becomes unreadable; healthy
+        // bodies in the same segment migrate normally; the counter is
+        // bumped exactly once per dropped body.
+        let tmp = TempDir::new().unwrap();
+        // 140-byte segment: header(16) + 2×(body_header(20) + body(40)) = 136
+        // fits two 40-byte bodies in seg 0; third (136 + 60 = 196 > 140)
+        // forces rotation into seg 1, which becomes the current segment.
+        let bs = BodyStore::open(tmp.path(), 140).unwrap();
+
+        let id_corrupt = bs.write_body(&vec![0xAA; 40]).unwrap(); // seg 0
+        let id_healthy = bs.write_body(&vec![0xBB; 40]).unwrap(); // seg 0
+        let _id_filler = bs.write_body(&vec![0xCC; 40]).unwrap(); // seg 1 (current)
+        bs.fsync().unwrap();
+
+        // Snapshot the corrupt body's location, then flip a byte in its
+        // payload to invalidate the CRC.
+        let (path, body_offset) = {
+            let inner = bs.inner.lock().unwrap();
+            let loc = inner.index.get(&id_corrupt).copied().unwrap();
+            (segment_path(&bs.dir, loc.seq), loc.offset)
+        };
+        let f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact_at(&mut byte, body_offset).unwrap();
+        byte[0] ^= 0xFF;
+        f.write_all_at(&byte, body_offset).unwrap();
+        drop(f);
+
+        // Compact segment 0. Should skip the corrupt body, migrate the
+        // healthy one, and unlink the segment.
+        let migrated = bs.compact_segment(0).unwrap();
+        assert_eq!(migrated, 1, "healthy body must still migrate");
+        assert_eq!(
+            bs.bodies_dropped_corrupted(),
+            1,
+            "corrupted body must be counted exactly once"
+        );
+
+        // Old segment file is gone — compaction completed despite the corruption.
+        assert!(!path.exists(), "old segment must be unlinked");
+
+        // The healthy body is still readable; the corrupt one is now NotFound.
+        assert_eq!(bs.read_body(id_healthy).unwrap(), vec![0xBB; 40]);
+        match bs.read_body(id_corrupt) {
+            Err(BodyStoreError::NotFound(_)) => {}
+            other => panic!("expected NotFound for dropped body, got {:?}", other),
+        }
     }
 }

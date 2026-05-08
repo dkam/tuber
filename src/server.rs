@@ -2292,6 +2292,7 @@ impl ServerState {
             toast_segments,
             toast_compactions_total,
             toast_bodies_migrated_total,
+            toast_bodies_dropped_corrupted,
         ) = match &self.body_store {
             Some(bs) => (
                 bs.total_bytes(),
@@ -2299,8 +2300,9 @@ impl ServerState {
                 bs.segment_count() as u64,
                 bs.compactions_total(),
                 bs.bodies_migrated_total(),
+                bs.bodies_dropped_corrupted(),
             ),
-            None => (0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0),
         };
 
         let yaml = format!(
@@ -2365,6 +2367,7 @@ impl ServerState {
              toast-segments: {}\n\
              toast-compactions-total: {}\n\
              toast-bodies-migrated-total: {}\n\
+             toast-bodies-dropped-corrupted: {}\n\
              max-storage-bytes: {}\n\
              current-concurrency-keys: {}\n\
              draining: {}\n\
@@ -2432,6 +2435,7 @@ impl ServerState {
             toast_segments,
             toast_compactions_total,
             toast_bodies_migrated_total,
+            toast_bodies_dropped_corrupted,
             self.max_storage_bytes.unwrap_or(0),
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
