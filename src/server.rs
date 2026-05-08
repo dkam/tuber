@@ -2880,22 +2880,15 @@ fn build_state(
     max_storage_bytes: Option<u64>,
     wal_dir: Option<&Path>,
     sync_interval: Duration,
+    migrate_wal: bool,
     name: Option<String>,
 ) -> io::Result<ServerState> {
     let mut state = ServerState::new(max_job_size, max_job_bytes, max_storage_bytes, name);
 
     if let Some(dir) = wal_dir {
-        // Body store sits next to the WAL in `<dir>/toast/`. Open it
-        // before the WAL so any v5 `BodyId` references in WAL records can
-        // resolve during replay. The directory is created on demand —
-        // existing operators upgrading without TOAST data will see an
-        // empty index, which is correct.
-        let toast_dir = dir.join("toast");
-        let body_store = Arc::new(BodyStore::open(
-            &toast_dir,
-            crate::body_store::DEFAULT_SEGMENT_SIZE,
-        )?);
-
+        // Open the WAL first so we can peek at file format versions before
+        // doing any TOAST/body-store work — that way a refusal returns
+        // cleanly with no on-disk side effects.
         let mut wal = Wal::open(
             dir,
             crate::wal::WalConfig {
@@ -2903,6 +2896,44 @@ fn build_state(
                 sync_interval,
             },
         )?;
+
+        // Legacy-format gate: pre-v5 records carry inline bodies that the
+        // replay path lifts into the body store. We refuse to migrate
+        // silently — operators who haven't reasoned about the upgrade
+        // should hit a clear stop sign before any data is touched.
+        if let Some(min_version) = wal.min_format_version()?
+            && min_version < crate::wal::WAL_VERSION
+            && !migrate_wal
+        {
+            return Err(io::Error::other(format!(
+                "WAL contains v{min_version} records, but this binary writes \
+                 v{}. Re-run with --migrate-wal to convert (inline bodies are \
+                 promoted into TOAST). Back up {dir:?} first if you want a \
+                 rollback option.",
+                crate::wal::WAL_VERSION,
+            )));
+        }
+        if let Some(min_version) = wal.min_format_version()?
+            && min_version < crate::wal::WAL_VERSION
+        {
+            tracing::info!(
+                "WAL legacy format detected (v{} → v{}); migrating via --migrate-wal",
+                min_version,
+                crate::wal::WAL_VERSION,
+            );
+        }
+
+        // Body store sits next to the WAL in `<dir>/toast/`. Open it after
+        // the version check so any v5 `BodyId` references in WAL records
+        // can resolve during replay. The directory is created on demand —
+        // existing operators upgrading without TOAST data see an empty
+        // index, which is correct.
+        let toast_dir = dir.join("toast");
+        let body_store = Arc::new(BodyStore::open(
+            &toast_dir,
+            crate::body_store::DEFAULT_SEGMENT_SIZE,
+        )?);
+
         let on_disk = wal.total_disk_bytes();
 
         tracing::info!("WAL: replaying {} bytes from {:?}", on_disk, dir);
@@ -2989,6 +3020,7 @@ pub async fn run(
     max_storage_bytes: Option<u64>,
     wal_dir: Option<&str>,
     sync_interval: Duration,
+    migrate_wal: bool,
     metrics_port: Option<u16>,
     name: Option<String>,
 ) -> io::Result<()> {
@@ -2999,6 +3031,7 @@ pub async fn run(
         max_storage_bytes,
         wal_path,
         sync_interval,
+        migrate_wal,
         name.clone(),
     )?;
 
@@ -3061,7 +3094,9 @@ pub async fn run_with_listener(
     wal_dir: Option<&Path>,
     name: Option<String>,
 ) -> io::Result<()> {
-    run_with_listener_limited(listener, max_job_size, None, None, wal_dir, name).await
+    // Test-only entry point: enable migration so legacy fixtures work
+    // without the integration-test harness gaining a flag of its own.
+    run_with_listener_limited(listener, max_job_size, None, None, wal_dir, true, name).await
 }
 
 /// Like [`run_with_listener`] but with explicit memory and storage budgets.
@@ -3073,6 +3108,7 @@ pub async fn run_with_listener_limited(
     max_job_bytes: Option<u64>,
     max_storage_bytes: Option<u64>,
     wal_dir: Option<&Path>,
+    migrate_wal: bool,
     name: Option<String>,
 ) -> io::Result<()> {
     let state = build_state(
@@ -3081,6 +3117,7 @@ pub async fn run_with_listener_limited(
         max_storage_bytes,
         wal_dir,
         crate::wal::DEFAULT_SYNC_INTERVAL,
+        migrate_wal,
         name,
     )?;
     serve(listener, state, max_job_size).await

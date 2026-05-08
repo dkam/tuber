@@ -24,7 +24,7 @@ const WAL_MAGIC: &[u8; 4] = b"TWAL";
 ///       Bodies live in the external body store ("TOAST"). Older versions
 ///       are still readable; their inline bodies are migrated into the body
 ///       store on replay.
-const WAL_VERSION: u32 = 5;
+pub const WAL_VERSION: u32 = 5;
 const WAL_VERSION_MIN: u32 = 3; // Oldest version we can still read
 const HEADER_SIZE: usize = 12; // magic(4) + version(4) + flags(4)
 const RECORD_TYPE_FULL_JOB: u8 = 0x01;
@@ -33,7 +33,8 @@ const STATE_CHANGE_PAYLOAD_LEN_V3: u32 = 21;
 const STATE_CHANGE_PAYLOAD_LEN: u32 = 22; // v4: added reason byte
 /// Size of a state change record: type(1) + job_id(8) + payload_len(4) + payload(22) + crc(4)
 const STATE_CHANGE_RECORD_SIZE: usize = 1 + 8 + 4 + 22 + 4;
-const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+/// Default cap on a single WAL segment before rotation (10 MiB).
+pub const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 const FILE_PREFIX: &str = "binlog.";
 /// Userland write buffer capacity per WAL file. Amortises syscall overhead.
 /// Durability is not affected: every path that calls `sync_all` first calls `flush`.
@@ -637,6 +638,9 @@ pub struct Wal {
     next_seq: u64,
     reserved_bytes: u64,
     alive_bytes: u64,
+    /// Sum of `WalFile.bytes_written` across all files. Maintained
+    /// incrementally so `total_disk_bytes()` is O(1) on the put hot path.
+    total_disk_bytes: u64,
     records_migrated: u64,
     /// External body store. When present, every WAL fsync is preceded by a
     /// body-store fsync so that any `BodyId` referenced by an acked WAL
@@ -671,7 +675,31 @@ impl Wal {
 
     /// Total bytes written across all WAL files.
     pub fn total_disk_bytes(&self) -> u64 {
-        self.files.iter().map(|f| f.bytes_written as u64).sum()
+        self.total_disk_bytes
+    }
+
+    /// Lowest format version found across all WAL files on disk. `Ok(None)`
+    /// means the WAL directory is empty (no files yet). Reads only the first
+    /// 12 bytes of each file — used at startup to decide whether legacy
+    /// migration is required, before any expensive replay work.
+    pub fn min_format_version(&self) -> io::Result<Option<u32>> {
+        use std::io::Read;
+        let mut min: Option<u32> = None;
+        for f in self.files.iter() {
+            let mut buf = [0u8; HEADER_SIZE];
+            let mut file = match File::open(&f.path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if file.read_exact(&mut buf).is_err() {
+                continue; // empty/truncated file — replay path will warn
+            }
+            if let Ok((v, _)) = read_header(&buf) {
+                min = Some(min.map_or(v, |m| m.min(v)));
+            }
+        }
+        Ok(min)
     }
 
     /// Number of job records migrated during compaction.
@@ -725,6 +753,7 @@ impl Wal {
             next_seq: 1,
             reserved_bytes: 0,
             alive_bytes: 0,
+            total_disk_bytes: 0,
             records_migrated: 0,
             body_store: None,
             lock_fd: Some(lock_fd),
@@ -803,13 +832,15 @@ impl Wal {
         for seq in seqs {
             let path = self.dir.join(format!("{}{:06}", FILE_PREFIX, seq));
             let meta = fs::metadata(&path)?;
+            let bytes = meta.len() as usize;
             self.files.push_back(WalFile {
                 seq,
                 path,
                 fd: None,
                 refs: 0,
-                bytes_written: meta.len() as usize,
+                bytes_written: bytes,
             });
+            self.total_disk_bytes += bytes as u64;
             if seq >= self.next_seq {
                 self.next_seq = seq + 1;
             }
@@ -843,6 +874,7 @@ impl Wal {
             refs: 0,
             bytes_written: HEADER_SIZE,
         });
+        self.total_disk_bytes += HEADER_SIZE as u64;
 
         Ok(())
     }
@@ -923,11 +955,13 @@ impl Wal {
         if sync_per_write {
             Self::flush_and_fsync(fd)?;
         }
+        let file_seq = file.seq;
+        self.total_disk_bytes += record_len as u64;
 
         // Update job's WAL tracking
         let old_seq = job.wal_file_seq;
         let old_used = job.wal_used;
-        job.wal_file_seq = Some(file.seq);
+        job.wal_file_seq = Some(file_seq);
         job.wal_used = record_len;
 
         // Decref old file
@@ -991,6 +1025,7 @@ impl Wal {
         if sync_per_write {
             Self::flush_and_fsync(fd)?;
         }
+        self.total_disk_bytes += record_len as u64;
 
         // Release reservation
         self.reserved_bytes = self
@@ -1232,6 +1267,9 @@ impl Wal {
         while self.files.len() > 1 {
             if self.files.front().map(|f| f.refs == 0).unwrap_or(false) {
                 let f = self.files.pop_front().unwrap();
+                self.total_disk_bytes = self
+                    .total_disk_bytes
+                    .saturating_sub(f.bytes_written as u64);
                 if let Err(e) = fs::remove_file(&f.path) {
                     tracing::warn!("WAL: failed to remove {:?}: {}", f.path, e);
                 }

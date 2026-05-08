@@ -110,6 +110,15 @@ enum Commands {
         )]
         max_storage_bytes: Option<u64>,
 
+        /// Opt in to migrating a legacy (pre-v5) WAL into the v5+TOAST
+        /// format on startup. Without this flag the server refuses to
+        /// start when it detects pre-v5 records, so operators get an
+        /// explicit decision point before in-place format conversion.
+        /// Set once on the upgrade run; once the WAL has been migrated
+        /// the flag becomes a no-op.
+        #[arg(long, requires = "binlog_dir", env = "TUBER_MIGRATE_WAL")]
+        migrate_wal: bool,
+
         /// Increase verbosity (-V for info, -VV for debug)
         #[arg(short = 'V', action = clap::ArgAction::Count, env = "TUBER_VERBOSE")]
         verbose: u8,
@@ -225,6 +234,7 @@ async fn main() {
             max_job_size,
             max_jobs_size,
             max_storage_bytes,
+            migrate_wal,
             verbose,
             metrics_port,
             name,
@@ -243,6 +253,7 @@ async fn main() {
                 max_storage_bytes,
                 binlog_dir.as_deref(),
                 sync_interval,
+                migrate_wal,
                 metrics_port,
                 name,
             )

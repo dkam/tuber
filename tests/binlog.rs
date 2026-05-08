@@ -63,6 +63,7 @@ impl TestServer {
                 None,
                 Some(max_storage_bytes),
                 Some(wal_dir_clone.as_path()),
+                true, // migrate legacy WALs in tests by default
                 None,
             )
             .await
@@ -100,6 +101,7 @@ impl TestServer {
                 Some(max_jobs_size),
                 None,
                 Some(wal_dir_clone.as_path()),
+                true, // tests can carry pre-v5 fixtures; allow migration
                 None,
             )
             .await;
@@ -110,6 +112,49 @@ impl TestServer {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // If the task has already finished with an error, surface it.
+        if handle.is_finished() {
+            match err_rx.await {
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(())) => {}
+                Err(_) => {}
+            }
+        }
+
+        Ok(TestServer {
+            port,
+            handle,
+            wal_dir,
+        })
+    }
+
+    /// Try to start with a specific `migrate_wal` setting, surfacing the
+    /// startup error if any. Used by the legacy-WAL refusal tests.
+    async fn try_start_with_migrate_wal(
+        dir: &Path,
+        migrate_wal: bool,
+    ) -> Result<Self, std::io::Error> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let wal_dir = dir.to_path_buf();
+        let wal_dir_clone = wal_dir.clone();
+
+        let (err_tx, err_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let result = tuber::server::run_with_listener_limited(
+                listener,
+                65535,
+                None,
+                None,
+                Some(wal_dir_clone.as_path()),
+                migrate_wal,
+                None,
+            )
+            .await;
+            let _ = err_tx.send(result);
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
         if handle.is_finished() {
             match err_rx.await {
                 Ok(Err(e)) => return Err(e),
@@ -1104,4 +1149,126 @@ async fn test_no_storage_budget_lets_puts_through() {
         c.mustsend(&format!("{}\r\n", body)).await;
         c.ckresp(&format!("INSERTED {}\r\n", i + 1)).await;
     }
+}
+
+/// Hand-craft a v4 WAL file containing one inline-body FullJob record. We
+/// can't go through `serialize_full_job` because that path now requires
+/// External; this mirrors the v4 layout byte-for-byte so the migration
+/// path has something realistic to chew on.
+fn write_legacy_v4_wal(dir: &Path, job_id: u64, body: &[u8]) {
+    let mut payload: Vec<u8> = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes()); // priority
+    payload.extend_from_slice(&0u64.to_le_bytes()); // delay_nanos
+    payload.extend_from_slice(&60_000_000_000u64.to_le_bytes()); // ttr 60s
+    payload.extend_from_slice(&0u64.to_le_bytes()); // created_at_epoch
+    payload.push(0); // state = Ready
+    for _ in 0..5 {
+        payload.extend_from_slice(&0u32.to_le_bytes()); // counters
+    }
+    let tube = b"default";
+    payload.extend_from_slice(&(tube.len() as u16).to_le_bytes());
+    payload.extend_from_slice(tube);
+    payload.extend_from_slice(&0u16.to_le_bytes()); // idp_key None
+    payload.extend_from_slice(&0u32.to_le_bytes()); // idp_ttl
+    payload.extend_from_slice(&0u16.to_le_bytes()); // group None
+    payload.extend_from_slice(&0u16.to_le_bytes()); // after_group None
+    payload.extend_from_slice(&0u16.to_le_bytes()); // concurrency_key None
+    payload.extend_from_slice(&0u32.to_le_bytes()); // concurrency_limit
+    payload.extend_from_slice(&(body.len() as u32).to_le_bytes()); // body_len
+    payload.extend_from_slice(body); // body bytes (v4 inline)
+
+    let mut record: Vec<u8> = Vec::new();
+    record.push(0x01); // FULL_JOB
+    record.extend_from_slice(&job_id.to_le_bytes());
+    record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    record.extend_from_slice(&payload);
+    let crc = crc32fast::hash(&record);
+    record.extend_from_slice(&crc.to_le_bytes());
+
+    let mut file: Vec<u8> = Vec::new();
+    file.extend_from_slice(b"TWAL");
+    file.extend_from_slice(&4u32.to_le_bytes()); // legacy version
+    file.extend_from_slice(&0u32.to_le_bytes()); // flags
+    file.extend_from_slice(&record);
+
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("binlog.000001"), file).unwrap();
+}
+
+/// Without `--migrate-wal`, a server pointed at a directory containing a
+/// pre-v5 WAL must refuse to start. The error message mentions the legacy
+/// version and the flag the operator should pass.
+#[tokio::test]
+async fn test_legacy_wal_refuses_start_without_migrate_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    write_legacy_v4_wal(dir.path(), 42, b"legacy-body");
+
+    let result = TestServer::try_start_with_migrate_wal(dir.path(), false).await;
+    let err = match result {
+        Ok(_) => panic!("server must refuse a v4 WAL without --migrate-wal"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("v4") && msg.contains("--migrate-wal"),
+        "error must explain the legacy version and the required flag, got: {msg}"
+    );
+
+    // Side-effect-free: the toast/ subdirectory should not have been created.
+    assert!(
+        !dir.path().join("toast").exists(),
+        "refusing should not create the body store"
+    );
+}
+
+/// With `--migrate-wal`, the same v4 WAL replays cleanly — its inline
+/// body lifts into the body store and the job is reservable.
+#[tokio::test]
+async fn test_legacy_wal_migrates_when_flag_set() {
+    let dir = tempfile::tempdir().unwrap();
+    write_legacy_v4_wal(dir.path(), 42, b"legacy-body");
+
+    let srv = TestServer::try_start_with_migrate_wal(dir.path(), true)
+        .await
+        .expect("migration must succeed");
+
+    let mut c = srv.connect().await;
+
+    // The replayed job is reservable; its body is what we wrote to the
+    // legacy WAL, now served from the body store.
+    c.mustsend("reserve-with-timeout 1\r\n").await;
+    c.ckresp("RESERVED 42 11\r\n").await;
+    c.ckresp("legacy-body\r\n").await;
+
+    // The body store now has the migrated body on disk.
+    let toast_dir = dir.path().join("toast");
+    assert!(toast_dir.is_dir(), "migration must populate toast/");
+    let entries: Vec<_> = std::fs::read_dir(&toast_dir).unwrap().collect();
+    assert!(!entries.is_empty(), "toast/ must contain at least one segment");
+}
+
+/// `--migrate-wal` against an already-migrated (v5) WAL is a no-op: the
+/// server starts cleanly without complaint.
+#[tokio::test]
+async fn test_migrate_flag_is_noop_on_current_format_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let srv = TestServer::start_with_wal(dir.path()).await;
+        let mut c = srv.connect().await;
+        c.mustsend("put 0 0 60 5\r\n").await;
+        c.mustsend("hello\r\n").await;
+        c.ckresp("INSERTED 1\r\n").await;
+        drop(c);
+        let _ = srv.shutdown();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // Restart with --migrate-wal; nothing to migrate, but no error either.
+    let srv = TestServer::try_start_with_migrate_wal(dir.path(), true)
+        .await
+        .expect("migrate-wal must be a no-op on a v5 WAL");
+    let mut c = srv.connect().await;
+    c.mustsend("peek 1\r\n").await;
+    c.ckresp("FOUND 1 5\r\n").await;
+    c.ckresp("hello\r\n").await;
 }

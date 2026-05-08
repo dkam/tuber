@@ -42,6 +42,7 @@ impl TestServer {
                 Some(max_jobs_size),
                 None,
                 None,
+                false, // no WAL → no migration to gate
                 None,
             )
             .await
