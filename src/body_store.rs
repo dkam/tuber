@@ -496,6 +496,16 @@ impl BodyStore {
             }
         }
 
+        // Force migrated bytes to disk before unlinking the old segment.
+        // Without this, a crash after `remove_file` but before the kernel
+        // writes the new segment through would lose every body we just
+        // migrated. Rotation mid-migration already fsyncs sealed
+        // segments (`Inner::rotate`), so only the current write segment
+        // needs syncing here. Skip the syscall when nothing migrated.
+        if migrated > 0 {
+            self.fsync()?;
+        }
+
         // Tear down the old segment: drop from map, account, unlink. Any
         // outstanding read holding `Arc<File>` keeps its FD valid through
         // the unlink (POSIX semantics) — that's what makes this safe.
