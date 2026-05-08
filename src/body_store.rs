@@ -427,6 +427,98 @@ impl BodyStore {
         self.inner.lock().unwrap().index.contains_key(&id)
     }
 
+    /// Snapshot of every `BodyId` currently in the index. Allocates a
+    /// `Vec` the size of the live body set — cheap at startup, would
+    /// be expensive on the hot path. Used by the startup integrity
+    /// check to find TOAST bodies that no WAL record references
+    /// (the symmetric case of `contains_body`: `cmd_put` wrote the
+    /// body successfully but `wal.write_put` failed, leaving a
+    /// stranded body that nothing will ever read).
+    pub fn body_ids(&self) -> Vec<BodyId> {
+        self.inner.lock().unwrap().index.keys().copied().collect()
+    }
+
+    /// Drop every TOAST body whose `BodyId` is not in `live_ids`, then
+    /// compact any segment that lost bodies as a result. The compaction
+    /// step is what makes this idempotent: without it, the bytes stay
+    /// in the segment file and `BodyStore::open` re-discovers them on
+    /// the next restart.
+    ///
+    /// Returns the number of bodies reclaimed. Compaction errors are
+    /// logged but don't fail the call — the index drop already
+    /// succeeded; bytes will be reclaimed by the next regular
+    /// compaction tick if startup compaction failed.
+    ///
+    /// Used by `build_state` for the symmetric counterpart of 4.5:
+    /// when a `cmd_put` wrote the body but the WAL write failed, the
+    /// body has no WAL anchor at all and no live job will ever
+    /// reference it.
+    pub fn reclaim_stranded(&self, live_ids: &std::collections::HashSet<BodyId>) -> u64 {
+        // Snapshot stranded ids and the segments they live in under one
+        // lock; release before doing per-segment compaction (which
+        // takes the lock itself).
+        let (stranded, affected_segs): (Vec<BodyId>, std::collections::HashSet<u64>) = {
+            let inner = self.inner.lock().unwrap();
+            let mut stranded = Vec::new();
+            let mut segs = std::collections::HashSet::new();
+            for (id, loc) in inner.index.iter() {
+                if !live_ids.contains(id) {
+                    stranded.push(*id);
+                    segs.insert(loc.seq);
+                }
+            }
+            (stranded, segs)
+        };
+
+        if stranded.is_empty() {
+            return 0;
+        }
+
+        let count = stranded.len() as u64;
+        self.delete_many(&stranded);
+
+        // If a stranded body sits in the *current* write segment,
+        // `compact_segment` would no-op on it (the current segment can
+        // still accept appends, and unlinking it would lose the next-
+        // write target). Force a rotation so that segment becomes
+        // sealed and compactable. Cost: a fresh 16-byte segment file
+        // that the next put will append into. Only worth it when the
+        // current segment is genuinely affected.
+        let current = self.inner.lock().unwrap().current_seq;
+        if let Some(cur) = current
+            && affected_segs.contains(&cur)
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Err(e) = inner.rotate(&self.dir) {
+                tracing::warn!(
+                    "stranded-body reclamation: rotation failed: {} \
+                     (current segment's strandeds will linger until next \
+                     compaction tick)",
+                    e,
+                );
+            } else {
+                self.total_bytes
+                    .fetch_add(FILE_HEADER_SIZE as u64, Ordering::Relaxed);
+                self.segment_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // Compact each affected segment so the bytes physically leave
+        // disk. compact_segment skips the (new) current segment.
+        for seq in affected_segs {
+            if let Err(e) = self.compact_segment(seq) {
+                tracing::warn!(
+                    "stranded-body compaction failed for segment {}: {} \
+                     (bytes will linger until the next compaction tick)",
+                    seq,
+                    e,
+                );
+            }
+        }
+
+        count
+    }
+
     /// Pick a sealed segment (i.e. not the one currently being appended to)
     /// whose live ratio has dropped below `threshold` (in [0.0, 1.0]). The
     /// most-wasted segment wins; ties go to the lowest seq. Returns `None`

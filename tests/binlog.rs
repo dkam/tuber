@@ -1180,6 +1180,65 @@ async fn test_startup_reaps_jobs_with_missing_toast_bodies() {
     }
 }
 
+/// Symmetric counterpart of the missing-body reaping test: TOAST
+/// contains a body that no WAL record references at all (the
+/// `cmd_put → write_body OK → wal_write_put FAIL` case). Simulate it
+/// by writing a body directly via BodyStore before the server starts —
+/// no WAL records exist for it. Startup should detect the stranded
+/// body and reclaim it.
+#[tokio::test]
+async fn test_startup_reclaims_stranded_toast_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Write a body straight into TOAST without going through the
+    // server. BodyStore::open creates the toast/ subdirectory, so
+    // mirror the layout the server expects (`<wal-dir>/toast/`).
+    {
+        let toast_dir = dir.path().join("toast");
+        let bs = tuber::body_store::BodyStore::open(
+            &toast_dir,
+            tuber::body_store::DEFAULT_SEGMENT_SIZE,
+        )
+        .expect("open body store");
+        bs.write_body(b"stranded-payload").expect("write stranded body");
+        bs.fsync().expect("fsync");
+    }
+
+    // Start the server. It opens the (empty) WAL, opens the BodyStore
+    // (which scans and indexes the stranded body), then the stranded
+    // reclamation walks the index and drops it because no live job
+    // points at it.
+    let srv = TestServer::start_with_wal(dir.path()).await;
+    let mut c = srv.connect().await;
+    c.mustsend("stats\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains("reclaimed-stranded-bodies: 1"),
+        "stats must report 1 stranded body reclaimed: {body}",
+    );
+    // After reclamation the byte count drops to just the file header
+    // of the new (empty) current segment that the force-rotation
+    // created. The original body is gone from disk.
+    assert!(
+        body.contains("toast-live-bytes: 0"),
+        "no live bytes should remain: {body}",
+    );
+
+    // Restart — no new stranded bodies on the second pass; the
+    // reclamation is idempotent.
+    drop(c);
+    let _ = srv.shutdown();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let srv2 = TestServer::start_with_wal(dir.path()).await;
+    let mut c2 = srv2.connect().await;
+    c2.mustsend("stats\r\n").await;
+    let body = c2.read_ok_body().await;
+    assert!(
+        body.contains("reclaimed-stranded-bodies: 0"),
+        "second restart should see no stranded bodies: {body}",
+    );
+}
+
 /// `--max-storage-bytes`: once the combined WAL+TOAST footprint plus a
 /// one-segment WAL reserve (≈10 MB) would exceed the budget, new puts
 /// are refused with `OUT_OF_STORAGE`. State changes (delete) always

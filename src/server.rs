@@ -129,6 +129,15 @@ struct GlobalStats {
     /// jump after a crash is informational; a steady upward trend across
     /// clean restarts would suggest a leak in the runtime delete path.
     reclaimed_orphan_bodies: u64,
+    /// TOAST bodies reclaimed at startup that no WAL record references at
+    /// all (as opposed to `reclaimed_orphan_bodies`, where the WAL did
+    /// have a delete record). The classic source is `cmd_put` whose
+    /// `write_body` succeeded but whose `wal.write_put` then failed:
+    /// the body sits in TOAST forever with nothing pointing at it.
+    /// One-shot value set during `build_state`. Every nonzero value
+    /// indicates a partial put that was never made durable — alert on
+    /// rate>0 across clean restarts.
+    reclaimed_stranded_bodies: u64,
 }
 
 /// State for a job group (grp:/aft: feature).
@@ -2402,6 +2411,7 @@ impl ServerState {
              toast-bodies-dropped-corrupted: {}\n\
              recovered-missing-bodies: {}\n\
              reclaimed-orphan-bodies: {}\n\
+             reclaimed-stranded-bodies: {}\n\
              max-storage-bytes: {}\n\
              current-concurrency-keys: {}\n\
              draining: {}\n\
@@ -2472,6 +2482,7 @@ impl ServerState {
             toast_bodies_dropped_corrupted,
             self.stats.recovered_missing_bodies,
             self.stats.reclaimed_orphan_bodies,
+            self.stats.reclaimed_stranded_bodies,
             self.max_storage_bytes.unwrap_or(0),
             self.concurrency_keys.len(),
             if self.drain_mode { "true" } else { "false" },
@@ -3129,6 +3140,52 @@ fn build_state(
             }
         }
         state.stats.recovered_missing_bodies = recovered_missing_bodies;
+
+        // TOAST/WAL write-failure matrix for a single put — what each
+        // outcome can leave on disk and which startup path cleans it up.
+        // `cmd_put` writes TOAST first (it needs the BodyId to build the
+        // WAL record), then WAL. Sync ordering is the same: TOAST fsync
+        // runs before WAL fsync.
+        //
+        //   T = TOAST step, W = WAL step, ✓ = succeeded, ✗ = failed.
+        //
+        //   T✓ W✓  Happy path. Body durable, WAL durable. Client acked
+        //          (immediately in relaxed mode, after sync in strict).
+        //
+        //   T✗ —   write_body fails. cmd_put returns InternalError
+        //          before WAL is touched. No state mutated. Nothing
+        //          to clean up. (W never attempted: the W/T == fail/ok
+        //          and fail/fail rows of the user's matrix collapse to
+        //          this single case.)
+        //
+        //   T✓ W✗  This is the leak. write_body succeeded; the WAL
+        //          write or fsync failed. self.wal becomes None, the
+        //          in-memory job lives until the next restart with no
+        //          journal, and the body sits in TOAST with no WAL
+        //          reference at all. The reclamation below catches it
+        //          on the *next* restart by walking the TOAST index
+        //          and dropping any id no live job points at. Reported
+        //          as `reclaimed-stranded-bodies` in stats.
+        //
+        // The complementary TOAST→WAL direction (WAL has a FullJob but
+        // TOAST is missing the body) is handled by 4.5 above:
+        // `recovered-missing-bodies`.
+        let live_body_ids: std::collections::HashSet<BodyId> = kept
+            .values()
+            .filter_map(|j| match &j.body {
+                BodyRef::External(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let stranded_count = body_store.reclaim_stranded(&live_body_ids);
+        if stranded_count > 0 {
+            tracing::warn!(
+                "WAL→TOAST: reclaimed {} stranded TOAST bodies (no WAL reference — \
+                 likely a partial put that didn't survive crash)",
+                stranded_count,
+            );
+            state.stats.reclaimed_stranded_bodies = stranded_count;
+        }
 
         state.restore_jobs(kept, next_id, tombstones);
 

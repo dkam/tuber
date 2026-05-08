@@ -313,6 +313,17 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
         &stats,
         "reclaimed-orphan-bodies",
     );
+    prom_counter(
+        &mut out,
+        "tuber_reclaimed_stranded_bodies_total",
+        "TOAST bodies reclaimed at startup that had no WAL reference at \
+         all — typically a partial put where write_body succeeded but \
+         the WAL write/fsync failed. Alert on rate>0 across clean \
+         restarts; every nonzero value indicates an acked put that didn't \
+         survive crash recovery.",
+        &stats,
+        "reclaimed-stranded-bodies",
+    );
 
     // Command counters (labeled)
     let cmd_keys = [

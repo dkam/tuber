@@ -482,6 +482,34 @@ synchronisation point.
   job — there's nothing to serve their bodies from. This is honest:
   the bodies are gone, so the jobs are. Move the WAL aside too if you
   want a clean restart with no recovery noise.
+- **Stranded-body reclamation** — symmetric to missing-body reaping.
+  `cmd_put` writes TOAST first, then WAL; if the WAL write fails after
+  TOAST succeeded, the body sits in TOAST with no WAL reference at
+  all. On startup, the reclamation walks the TOAST index, drops any
+  `BodyId` that no live job points at, and force-compacts the
+  affected segments so the bytes physically leave disk (the new
+  current segment created by the rotation costs one 16-byte file
+  header). Counted as `reclaimed-stranded-bodies`.
+
+### TOAST/WAL write-failure matrix for one put
+
+`cmd_put` writes TOAST first (it needs the `BodyId` to build the WAL
+record), then WAL. The fsync ordering at sync time is the same: TOAST
+fsync runs before WAL fsync. Each cell shows what's left on disk and
+which startup path cleans it up.
+
+|   | TOAST ✓ | TOAST ✗ |
+|---|---------|---------|
+| **WAL ✓** | Happy path. Body durable, WAL durable. Client acked (immediately in relaxed mode, after sync in strict). | *Unreachable* — WAL is only attempted after `write_body` succeeds. |
+| **WAL ✗** | The leak. Body in TOAST, no WAL reference. WAL gets disabled (`self.wal = None`). On restart: stranded-body reclamation drops the index entry and force-compacts the segment. Counted as `reclaimed-stranded-bodies`. Alert on rate>0. | *Unreachable* — `write_body` errored first; cmd_put returned `INTERNAL_ERROR` and never touched WAL. Equivalent to TOAST ✗ alone. No state, no leak. |
+
+The complementary direction — WAL has a FullJob but TOAST is missing
+the body (segment header bit-rot, manual `rm`, the corruption-drop
+path in `compact_segment`) — is handled by the missing-body reaping
+described above. Counted as `recovered-missing-bodies`.
+
+The two paths are independent. A single restart can produce nonzero
+counts on both if multiple distinct failures happened.
 
 ## TOAST Version History
 
