@@ -51,6 +51,13 @@ const FIND_UNBLOCKED_MAX_VISITS: usize = 256;
 /// realistic delete bursts without burning cycles on idle queues.
 const TOAST_COMPACTION_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Wall-clock budget for compaction work per tick. Each tick drains as
+/// many eligible segments as it can within this budget, then yields
+/// until the next interval. Bounds runtime impact while letting
+/// trivial (all-dead) segments unlink in bulk after a big delete burst,
+/// which used to take ~5s × N segments to clear.
+const TOAST_COMPACTION_TICK_BUDGET: Duration = Duration::from_millis(200);
+
 // Op index constants matching beanstalkd (see tmp/prot.c)
 const OP_PUT: usize = 1;
 const OP_PEEKJOB: usize = 2;
@@ -3462,43 +3469,59 @@ async fn serve(listener: TcpListener, mut state: ServerState, max_job_size: u32)
                         _ = shutdown.notified() => break,
                         _ = interval.tick() => {}
                     }
-                    let Some(seq) = bs.compaction_candidate(
-                        crate::body_store::COMPACTION_LIVE_RATIO_THRESHOLD,
-                    ) else {
-                        continue;
-                    };
+                    // Drain as many eligible segments as fit in the
+                    // per-tick budget. Empty (all-dead) segments are
+                    // microseconds each; real migrations cost more, and
+                    // the budget caps the worst case so we don't
+                    // monopolise the runtime when there's a mountain to
+                    // clear.
+                    //
                     // Compaction is synchronous file IO: pwrite + fsync per
                     // body, plus an unlink at the end. On fast SSD with
                     // typical bodies it's well under 100 ms, but on slow
                     // storage (HDD/NAS), large bodies, or under CPU pressure
                     // it can stall the runtime. Run on the blocking pool so
                     // a slow compaction can't starve other tokio tasks.
-                    let bs_for_blocking = Arc::clone(&bs);
-                    let result = tokio::task::spawn_blocking(move || {
-                        bs_for_blocking.compact_segment(seq)
-                    })
-                    .await;
-                    match result {
-                        Ok(Ok(n)) if n > 0 => {
-                            tracing::info!(
-                                "TOAST compacted segment {}: migrated {} bodies",
-                                seq, n
-                            );
-                        }
-                        Ok(Ok(_)) => {
-                            tracing::debug!("TOAST compacted segment {}: empty", seq);
-                        }
-                        Ok(Err(e)) => {
-                            tracing::error!(
-                                "TOAST compaction failed for segment {}: {}",
-                                seq, e
-                            );
-                        }
-                        Err(je) => {
-                            tracing::error!(
-                                "TOAST compaction task panicked on segment {}: {}",
-                                seq, je
-                            );
+                    let tick_start = std::time::Instant::now();
+                    while tick_start.elapsed() < TOAST_COMPACTION_TICK_BUDGET {
+                        let Some(seq) = bs.compaction_candidate(
+                            crate::body_store::COMPACTION_LIVE_RATIO_THRESHOLD,
+                        ) else {
+                            break;
+                        };
+                        let bs_for_blocking = Arc::clone(&bs);
+                        let result = tokio::task::spawn_blocking(move || {
+                            bs_for_blocking.compact_segment(seq)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(n)) if n > 0 => {
+                                tracing::info!(
+                                    "TOAST compacted segment {}: migrated {} bodies",
+                                    seq, n
+                                );
+                            }
+                            Ok(Ok(_)) => {
+                                tracing::debug!("TOAST compacted segment {}: empty", seq);
+                            }
+                            Ok(Err(e)) => {
+                                tracing::error!(
+                                    "TOAST compaction failed for segment {}: {}",
+                                    seq, e
+                                );
+                                // Don't loop on a persistently-failing
+                                // segment — bail and let the next tick
+                                // try again (so transient failures don't
+                                // hot-spin under the budget).
+                                break;
+                            }
+                            Err(je) => {
+                                tracing::error!(
+                                    "TOAST compaction task panicked on segment {}: {}",
+                                    seq, je
+                                );
+                                break;
+                            }
                         }
                     }
                 }
