@@ -236,7 +236,7 @@ async fn gather_metrics(beanstalk_addr: &str) -> io::Result<String> {
     prom_gauge(
         &mut out,
         "tuber_max_storage_bytes",
-        "Configured --max-storage-bytes limit (0 if unlimited)",
+        "Configured --max-storage-bytes limit (0 when persistence is disabled)",
         &stats,
         "max-storage-bytes",
     );

@@ -103,7 +103,9 @@ enum Commands {
         /// budget once compaction reclaims). One WAL segment's worth of
         /// headroom is reserved so deletes can always be journalled.
         /// Accepts suffixes: k, m, g, t (e.g. 100g, 50G).
-        /// Only meaningful when --binlog-dir is set; default: unlimited.
+        /// Required when --binlog-dir is set: the server refuses to start
+        /// with persistence enabled and no disk budget. A common starting
+        /// point is 80% of the volume. Otherwise (in-memory mode) ignored.
         #[arg(
             long,
             value_parser = tuber::server::parse_bytes,
