@@ -182,6 +182,24 @@ impl Job {
     }
 }
 
+/// Collect every `BodyId` referenced by an External body in `jobs`. Used
+/// by both the WAL replay's orphan filter (re-creates within the same
+/// WAL invalidate orphan candidates) and the startup integrity pass
+/// (TOAST bodies without a WAL anchor).
+pub fn live_external_body_ids<I>(jobs: I) -> std::collections::HashSet<BodyId>
+where
+    I: IntoIterator,
+    I::Item: std::borrow::Borrow<Job>,
+{
+    use std::borrow::Borrow;
+    jobs.into_iter()
+        .filter_map(|j| match &j.borrow().body {
+            BodyRef::External(id) => Some(*id),
+            BodyRef::Inline(_) => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

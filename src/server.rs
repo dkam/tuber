@@ -115,28 +115,15 @@ struct GlobalStats {
     /// `total_job_bytes` while the live set (jobs + tombstones) was empty.
     /// Every increment is a tuber bug; alert on it.
     accounting_drift_events: u64,
-    /// Jobs reaped at startup because their WAL FullJob record referenced
-    /// a `BodyId` that wasn't present in TOAST (segment header corruption,
-    /// manual file removal, or the corruption-drop path in
-    /// `compact_segment`). One-shot value set during `build_state`.
-    /// Every nonzero value indicates lost data — alert on it.
+    /// Jobs whose WAL FullJob referenced a missing TOAST body. Alert on
+    /// rate>0 — every increment is lost data.
     recovered_missing_bodies: u64,
-    /// TOAST bodies reclaimed at startup because the WAL records their
-    /// owning job as deleted but the pre-WAL-fsync `BodyStore::delete`
-    /// never landed (server crashed between WAL fsync and TOAST cleanup).
-    /// One-shot value set during `build_state`. Routine — small steady-
-    /// state numbers indicate the reclamation path is working. A *large*
-    /// jump after a crash is informational; a steady upward trend across
-    /// clean restarts would suggest a leak in the runtime delete path.
+    /// Bodies whose WAL delete didn't land before crash. Routine; alert
+    /// on a sustained upward trend across clean restarts (runtime delete
+    /// leak).
     reclaimed_orphan_bodies: u64,
-    /// TOAST bodies reclaimed at startup that no WAL record references at
-    /// all (as opposed to `reclaimed_orphan_bodies`, where the WAL did
-    /// have a delete record). The classic source is `cmd_put` whose
-    /// `write_body` succeeded but whose `wal.write_put` then failed:
-    /// the body sits in TOAST forever with nothing pointing at it.
-    /// One-shot value set during `build_state`. Every nonzero value
-    /// indicates a partial put that was never made durable — alert on
-    /// rate>0 across clean restarts.
+    /// Bodies with no WAL reference at all — the put wrote TOAST but the
+    /// WAL write failed. Alert on rate>0 across clean restarts.
     reclaimed_stranded_bodies: u64,
 }
 
@@ -344,11 +331,6 @@ impl ServerState {
                 match bs.read_body(*id) {
                     Ok(bytes) => Some(bytes),
                     Err(e) => {
-                        // Structured fields so an alert on these errors
-                        // can be correlated back to the job, tube, and
-                        // job state. The body_id alone isn't enough —
-                        // operators trying to triage need to know which
-                        // tube is poisoned and what state the job's in.
                         tracing::error!(
                             job_id = job.id,
                             body_id = id.0,
@@ -3141,42 +3123,12 @@ fn build_state(
         }
         state.stats.recovered_missing_bodies = recovered_missing_bodies;
 
-        // TOAST/WAL write-failure matrix for a single put — what each
-        // outcome can leave on disk and which startup path cleans it up.
-        // `cmd_put` writes TOAST first (it needs the BodyId to build the
-        // WAL record), then WAL. Sync ordering is the same: TOAST fsync
-        // runs before WAL fsync.
-        //
-        //   T = TOAST step, W = WAL step, ✓ = succeeded, ✗ = failed.
-        //
-        //   T✓ W✓  Happy path. Body durable, WAL durable. Client acked
-        //          (immediately in relaxed mode, after sync in strict).
-        //
-        //   T✗ —   write_body fails. cmd_put returns InternalError
-        //          before WAL is touched. No state mutated. Nothing
-        //          to clean up. (W never attempted: the W/T == fail/ok
-        //          and fail/fail rows of the user's matrix collapse to
-        //          this single case.)
-        //
-        //   T✓ W✗  This is the leak. write_body succeeded; the WAL
-        //          write or fsync failed. self.wal becomes None, the
-        //          in-memory job lives until the next restart with no
-        //          journal, and the body sits in TOAST with no WAL
-        //          reference at all. The reclamation below catches it
-        //          on the *next* restart by walking the TOAST index
-        //          and dropping any id no live job points at. Reported
-        //          as `reclaimed-stranded-bodies` in stats.
-        //
-        // The complementary TOAST→WAL direction (WAL has a FullJob but
-        // TOAST is missing the body) is handled by 4.5 above:
-        // `recovered-missing-bodies`.
-        let live_body_ids: std::collections::HashSet<BodyId> = kept
-            .values()
-            .filter_map(|j| match &j.body {
-                BodyRef::External(id) => Some(*id),
-                _ => None,
-            })
-            .collect();
+        // Reclaim TOAST bodies left orphan by a put that wrote the body
+        // but failed the WAL write. See "TOAST/WAL write-failure matrix"
+        // in docs/wal-format.md for the full failure analysis. The
+        // complementary direction (WAL FullJob with missing TOAST) is
+        // handled by the recovered-missing-bodies pass above.
+        let live_body_ids = crate::job::live_external_body_ids(kept.values());
         let stranded_count = body_store.reclaim_stranded(&live_body_ids);
         if stranded_count > 0 {
             tracing::warn!(

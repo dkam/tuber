@@ -427,32 +427,13 @@ impl BodyStore {
         self.inner.lock().unwrap().index.contains_key(&id)
     }
 
-    /// Snapshot of every `BodyId` currently in the index. Allocates a
-    /// `Vec` the size of the live body set — cheap at startup, would
-    /// be expensive on the hot path. Used by the startup integrity
-    /// check to find TOAST bodies that no WAL record references
-    /// (the symmetric case of `contains_body`: `cmd_put` wrote the
-    /// body successfully but `wal.write_put` failed, leaving a
-    /// stranded body that nothing will ever read).
-    pub fn body_ids(&self) -> Vec<BodyId> {
-        self.inner.lock().unwrap().index.keys().copied().collect()
-    }
-
     /// Drop every TOAST body whose `BodyId` is not in `live_ids`, then
     /// compact any segment that lost bodies as a result. The compaction
-    /// step is what makes this idempotent: without it, the bytes stay
+    /// step is what makes this idempotent: without it the bytes linger
     /// in the segment file and `BodyStore::open` re-discovers them on
-    /// the next restart.
-    ///
-    /// Returns the number of bodies reclaimed. Compaction errors are
-    /// logged but don't fail the call — the index drop already
-    /// succeeded; bytes will be reclaimed by the next regular
-    /// compaction tick if startup compaction failed.
-    ///
-    /// Used by `build_state` for the symmetric counterpart of 4.5:
-    /// when a `cmd_put` wrote the body but the WAL write failed, the
-    /// body has no WAL anchor at all and no live job will ever
-    /// reference it.
+    /// every restart. Compaction errors are non-fatal — the index drop
+    /// already succeeded, so the next regular compaction tick will
+    /// catch up.
     pub fn reclaim_stranded(&self, live_ids: &std::collections::HashSet<BodyId>) -> u64 {
         // Snapshot stranded ids and the segments they live in under one
         // lock; release before doing per-segment compaction (which

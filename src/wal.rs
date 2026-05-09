@@ -3,7 +3,7 @@
 // When enabled via `-b <dir>`, all job mutations are logged to append-only files.
 // On restart, the WAL is replayed to restore state.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -1269,13 +1269,7 @@ impl Wal {
         // Filter orphans against the final job set: a job may have been
         // recreated under the same id within the same WAL, in which case
         // the "orphan" is now live again and must not be deleted.
-        let live_body_ids: HashSet<BodyId> = jobs
-            .values()
-            .filter_map(|j| match &j.body {
-                BodyRef::External(id) => Some(*id),
-                BodyRef::Inline(_) => None,
-            })
-            .collect();
+        let live_body_ids = crate::job::live_external_body_ids(jobs.values());
         orphan_bodies.retain(|id| !live_body_ids.contains(id));
 
         Ok((jobs, max_id + 1, tombstones, orphan_bodies))
