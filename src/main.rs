@@ -72,6 +72,7 @@ enum Commands {
         /// `--sync-interval`. The env var `TUBER_WAL_SYNC_INTERVAL` is
         /// also still honoured.
         #[arg(
+            short = 'i',
             long,
             alias = "wal-sync-interval",
             default_value = "100ms",
@@ -107,6 +108,7 @@ enum Commands {
         /// with persistence enabled and no disk budget. A common starting
         /// point is 80% of the volume. Otherwise (in-memory mode) ignored.
         #[arg(
+            short = 's',
             long,
             value_parser = tuber::server::parse_bytes,
             requires = "binlog_dir",
