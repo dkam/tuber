@@ -155,8 +155,10 @@ All the great hits — priority queues, delayed jobs, TTR, named tubes, bury & k
 - **Bury & kick** — set aside problem jobs for later inspection, then kick them back to ready.
 - **Peek** — inspect jobs without reserving them. Peek by ID, or peek at the next ready/delayed/buried job.
 - **Pause** — temporarily stop a tube from serving jobs.
-- **Persistence** — optional write-ahead log (`-b` flag) for crash recovery.
-- **Memory budget** — `--max-jobs-size` caps the total in-memory footprint of all jobs. PUT returns `OUT_OF_MEMORY` when the budget is exhausted, giving producers an explicit backpressure signal instead of a silent OOM kill. Workers can always reserve, release, bury, kick, and delete — state transitions never fail due to the budget. Stats (`current-jobs-size`, `max-jobs-size`) and Prometheus gauges (`tuber_jobs_size_bytes`, `tuber_jobs_size_limit_bytes`) let you alert before the budget fills up. The budget also applies at startup: if the WAL is larger than the configured limit (e.g. after tightening the limit on a previously-unbounded server), tuber aborts with a diagnostic error instead of OOMing mid-replay.
+- **Persistence with split storage** — optional write-ahead log (`-b` flag) for crash recovery, with job bodies stored separately from metadata in an append-only body store. The WAL stays small (records carry just metadata + a body reference), so fsyncs are cheap regardless of body size. Bodies live on disk and stream into worker responses on demand.
+- **Large job bodies, tiny RAM** — because bodies live on disk, the in-memory cost per job is ~512 bytes regardless of body size. A 1 MB job uses the same RAM as a 1 KB job. Real-world numbers: 1058 active jobs × 1 MB bodies = ~1 GiB on disk, ~540 KB in RAM (~2000× more 1 MB jobs at the same RAM budget vs. an in-memory queue). The queue scales by job *count*, not job *size*.
+- **Memory budget** — `--max-jobs-size` caps in-memory job footprint (metadata + idempotency tombstones when persistence is on; full job bytes when it isn't). PUT returns `OUT_OF_MEMORY` when the budget is exhausted, giving producers an explicit backpressure signal instead of a silent OOM kill. Workers can always reserve, release, bury, kick, and delete — state transitions never fail due to the budget. Stats (`current-jobs-size`, `max-jobs-size`) and Prometheus gauges (`tuber_jobs_size_bytes`, `tuber_jobs_size_limit_bytes`) let you alert before the budget fills up. The budget also applies at startup: tuber aborts with a diagnostic error rather than OOMing mid-replay.
+- **Storage budget** — `--max-storage-bytes` (mandatory with `-b`) caps the combined WAL + body-store footprint on disk. PUT returns `OUT_OF_STORAGE` once exceeded; state changes always succeed because tuber reserves one WAL segment's headroom for delete/release/bury/kick records. No more silent disk-fill outages.
 - **Prometheus metrics** — expose a `/metrics` endpoint for monitoring. See [Statistics Reference](docs/statistics.md#prometheus-metrics).
 
 ### Statistics
@@ -414,9 +416,12 @@ tuber server [OPTIONS]
 |---|---|---|---|
 | `-l`, `--listen` | `TUBER_LISTEN` | `0.0.0.0` | Listen address |
 | `-p`, `--port` | `TUBER_PORT` | `11300` | Listen port |
-| `-b`, `--binlog-dir` | `TUBER_BINLOG_DIR` | — | WAL directory (enables persistence) |
+| `-b`, `--binlog-dir` | `TUBER_BINLOG_DIR` | — | WAL + body-store directory (enables persistence) |
+| `-s`, `--max-storage-bytes` | `TUBER_MAX_STORAGE_BYTES` | — | Combined cap on WAL + body-store disk usage. **Mandatory** when `-b` is set. PUT returns `OUT_OF_STORAGE` when the projected footprint would exceed this; state changes (reserve/release/bury/kick/delete) always succeed. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `100g`). |
+| `-i`, `--sync-interval` | `TUBER_SYNC_INTERVAL` | `100ms` | How often the WAL and body store fsync to disk. Lower = less data loss on crash, more I/O. Accepts `ms`, `s`, `m`, `h`. |
+| `--migrate-wal` | `TUBER_MIGRATE_WAL` | off | Opt in to upgrading a pre-v5 WAL to the v5 + body-store format on startup. Without this flag the server refuses to start when it detects pre-v5 records. |
 | `-z`, `--max-job-size` | `TUBER_MAX_JOB_SIZE` | `65535` | Max size of a single job body. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `64k`). |
-| `--max-jobs-size` | `TUBER_MAX_JOBS_SIZE` | unlimited | Max total in-memory size of all jobs (bodies + per-job overhead + tombstones). PUT returns `OUT_OF_MEMORY` when exceeded; reserve/release/bury/kick/delete always succeed. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `2g`, `500M`). |
+| `--max-jobs-size` | `TUBER_MAX_JOBS_SIZE` | unlimited | Max total in-memory footprint of jobs. With persistence enabled, bodies live on disk and don't count — this caps job *metadata* (~512 B/job) plus idempotency tombstones. Without persistence, bodies are in RAM and counted. PUT returns `OUT_OF_MEMORY` when exceeded; reserve/release/bury/kick/delete always succeed. Accepts suffixes: `k`, `m`, `g`, `t` (e.g. `2g`, `500M`). |
 | `-V` | `TUBER_VERBOSE` | warn | Verbosity (`-V` info, `-VV` debug) |
 | `--metrics-port` | `TUBER_METRICS_PORT` | — | Prometheus metrics endpoint port |
 | `--name` | `TUBER_NAME` | — | Instance name (shown in stats and metrics) |
@@ -428,18 +433,24 @@ tuber server -p 11301 -b /var/lib/tuber
 # Verbose mode with metrics
 tuber server -VV --metrics-port 9100
 
-# Memory-bounded server (Docker-friendly)
-tuber server --max-jobs-size 2g -b /var/lib/tuber --metrics-port 9100
+# Memory-bounded + disk-bounded server (Docker-friendly)
+tuber server --max-jobs-size 2g -b /var/lib/tuber -s 100g --metrics-port 9100
 ```
 
 #### Durability & fsync
 
-When persistence is enabled (`-b`), tuber appends job mutations to a write-ahead log (WAL). The WAL is fsynced every 100ms as part of the server's internal tick — not on every write. This means:
+When persistence is enabled (`-b`), tuber writes job mutations to two append-only stores:
 
-- **At most 100ms of data can be lost on a crash.** Jobs written in the last tick interval may not have been fsynced to disk yet.
-- **fsync overhead is constant regardless of throughput.** Whether you're doing 10 jobs/sec or 100,000 jobs/sec, tuber calls fsync ~10 times per second. On NVMe/SSD storage this adds negligible latency; on spinning disks it costs ~50–150ms/sec of I/O time.
+- **WAL** — small metadata records (`FullJob`, `StateChange`) carrying a `BodyId` reference, not the body bytes themselves.
+- **Body store** — separate segment files holding the raw job payloads, addressed by `BodyId`.
 
-This is a different trade-off from databases like PostgreSQL or MySQL, which fsync on every transaction commit to guarantee durability of each acknowledged write (the "D" in ACID). Tuber's `INSERTED` response means the job is buffered in the WAL but not necessarily fsynced — similar to PostgreSQL's `synchronous_commit = off` mode. For most queue workloads, losing a fraction of a second of jobs on a hard crash is acceptable, and the throughput benefit is significant.
+Both are fsynced every `--sync-interval` (default 100ms) as part of the server's internal tick — not on every write. The body store fsyncs *first*, then the WAL, so a crash mid-sync can leave orphan bodies (no WAL reference) but never dangling references; orphans are reclaimed automatically on the next replay.
+
+- **At most one tick interval of data can be lost on a crash.** Jobs written since the last sync may not have made it to disk yet.
+- **fsync overhead is constant regardless of throughput.** Whether you're doing 10 jobs/sec or 100,000 jobs/sec, tuber calls fsync at the configured rate. On NVMe/SSD storage this adds negligible latency; on spinning disks it costs ~50–150ms/sec of I/O time.
+- **Large bodies don't slow down fsync.** Because the WAL records only carry a `BodyId`, the latency-critical WAL fsync flushes a constant ~100 bytes per record regardless of body size.
+
+This is a different trade-off from databases like PostgreSQL or MySQL, which fsync on every transaction commit to guarantee durability of each acknowledged write (the "D" in ACID). Tuber's `INSERTED` response means the job is buffered but not necessarily fsynced — similar to PostgreSQL's `synchronous_commit = off` mode. For most queue workloads, losing a fraction of a second of jobs on a hard crash is acceptable, and the throughput benefit is significant.
 
 Without `-b`, all state is in-memory only and lost on restart.
 
