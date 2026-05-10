@@ -4621,6 +4621,10 @@ async fn test_stats_tube_new_fields_present() {
         "processing-time-p95:",
         "processing-time-p99:",
         "bury-rate:",
+        "oldest-ready-id:",
+        "oldest-ready-age:",
+        "oldest-delayed-age:",
+        "oldest-buried-age:",
     ] {
         assert!(
             body.contains(field),
@@ -4629,6 +4633,29 @@ async fn test_stats_tube_new_fields_present() {
             body
         );
     }
+}
+
+#[tokio::test]
+async fn test_stats_tube_oldest_ready_tracks_head() {
+    let srv = TestServer::start().await;
+    let mut c = srv.connect().await;
+
+    // Empty tube: oldest-ready-id and oldest-ready-age both 0.
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(body.contains("oldest-ready-id: 0"), "{}", body);
+    assert!(body.contains("oldest-ready-age: 0"), "{}", body);
+
+    // After a put, oldest-ready-id matches the inserted job and age is small.
+    let id = c.put_job(0, 0, 60, "x").await;
+    c.mustsend("stats-tube default\r\n").await;
+    let body = c.read_ok_body().await;
+    assert!(
+        body.contains(&format!("oldest-ready-id: {}", id)),
+        "expected oldest-ready-id {} in: {}",
+        id,
+        body
+    );
 }
 
 #[tokio::test]

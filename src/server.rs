@@ -2187,6 +2187,30 @@ impl ServerState {
 
         let bury_rate = tube.stat.bury_rate();
 
+        let now = Instant::now();
+        let age_secs = |id: u64| -> u64 {
+            self.jobs
+                .get(&id)
+                .map(|j| now.saturating_duration_since(j.created_at).as_secs())
+                .unwrap_or(0)
+        };
+        let (oldest_ready_id, oldest_ready_age) = tube
+            .ready
+            .peek()
+            .map(|(_, id)| (*id, age_secs(*id)))
+            .unwrap_or((0, 0));
+        let oldest_delayed_age = tube
+            .delay
+            .peek()
+            .map(|(_, id)| age_secs(*id))
+            .unwrap_or(0);
+        let oldest_buried_age = tube
+            .buried
+            .front()
+            .copied()
+            .map(age_secs)
+            .unwrap_or(0);
+
         let yaml = format!(
             "---\n\
              name: \"{}\"\n\
@@ -2199,6 +2223,10 @@ impl ServerState {
              current-using: {}\n\
              current-watching: {}\n\
              current-waiting: {}\n\
+             oldest-ready-id: {}\n\
+             oldest-ready-age: {}\n\
+             oldest-delayed-age: {}\n\
+             oldest-buried-age: {}\n\
              cmd-delete: {}\n\
              cmd-pause-tube: {}\n\
              pause: {}\n\
@@ -2233,6 +2261,10 @@ impl ServerState {
             tube.using_ct,
             tube.watching_ct,
             tube.stat.waiting_ct,
+            oldest_ready_id,
+            oldest_ready_age,
+            oldest_delayed_age,
+            oldest_buried_age,
             tube.stat.total_delete_ct,
             tube.stat.pause_ct,
             tube.pause.as_secs(),
