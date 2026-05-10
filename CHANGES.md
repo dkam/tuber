@@ -1,5 +1,40 @@
 # Changes
 
+## v0.6.2
+
+**`stats-tube` head-of-queue ages for starvation triage**
+
+Adds `oldest-ready-id`, `oldest-ready-age`, `oldest-delayed-age`, and `oldest-buried-age` to `stats-tube`. The age values come from the heap roots (and `buried.front()`), which match the next-to-serve job — exactly what you want when diagnosing "is this tube draining or starving?" without having to chain `peek-ready` + `stats-job`. All ages are seconds; `oldest-ready-id` is `0` when the bucket is empty.
+
+## v0.6.1
+
+**TOAST compactor throughput, short flags**
+
+- TOAST compactor now drains multiple sealed segments per tick under a single wall-clock budget instead of one per tick, so backlog catches up faster on a busy server.
+- Structured `tracing` fields and leaner comments in the compaction loop.
+- Short flags: `-s` for `--max-storage-bytes`, `-i` for `--sync-interval`.
+- README rewrite that explains the WAL/TOAST split and why it matters.
+
+## v0.6.0
+
+**WAL/TOAST split: external body store with combined disk budget**
+
+The WAL was carrying job bodies inline, which made compaction expensive (whole bodies copied between segments) and made the disk footprint unpredictable for large jobs. v0.6.0 splits storage in two: the WAL holds metadata and references, and bodies live in a separate append-only TOAST store under `<binlog_dir>/toast/`. Compaction now moves bytes only when bodies are actually dead.
+
+- **WAL v5** — `FullJob` records carry a `BodyId` reference instead of inline bytes; `StateChange` records unchanged. Reader still accepts v3/v4; on first replay legacy inline bodies are migrated into TOAST. `--migrate-wal` opt-in for explicit pre-v5 conversion.
+- **TOAST format v1** — append-only `body.NNNNNN` segments under `<binlog_dir>/toast/`. Per-body header is `body_id u64 + len u32 + crc32 u32 + reserved u32`; file header is `"TBOD" + version + reserved`. 64 MiB default segment size. Concurrent reads, durable rotation.
+- **Sync ordering** — every WAL fsync is preceded by a TOAST fsync. A crash mid-sync leaves orphan bodies, never dangling references; orphans are detected on replay and reclaimed.
+- **`--max-storage-bytes` (mandatory with `-b`)** — caps WAL + TOAST combined. Puts return `OUT_OF_STORAGE` once the budget minus a one-segment WAL reserve (proportional, ≤10 MiB) would be exceeded; state changes (delete/release/bury/kick/touch) always succeed. New flag joins `--max-jobs-size` (in-RAM cap, returns `OUT_OF_MEMORY`).
+- **`--sync-interval` (renamed from `--wal-sync-interval`)** — drives both stores. Old name kept as a hidden alias.
+- **Group commit** — WAL+TOAST fsyncs are amortised across the engine's drained batch instead of fsyncing per write. Strict/relaxed sync modes split out so relaxed mode skips the drain.
+- **Crash-recovery hardening at startup**:
+  - Reap WAL-references-missing-TOAST jobs (FullJob points to a body that doesn't exist).
+  - Reclaim stranded TOAST bodies (TOAST has bytes that no live WAL job points to).
+  - Reclaim orphan bodies left by interrupted syncs.
+- **Compaction safety** — TOAST drops CRC-failed bodies and continues instead of aborting; migrated bodies are fsynced before the old segment is unlinked.
+- **Stats + Prometheus** — TOAST gauges (segment count, total bytes, alive bytes, live ratio) and counters (`reclaimed-orphan-bodies`, `reclaimed-stranded-bodies`, `recovered-missing-bodies`, `toast-bodies-migrated-total`, `toast-bodies-dropped-corrupted`).
+- **Tracing on the read path** — `fetch_body` emits structured fields for triage when a body lookup fails.
+
 ## v0.5.7
 
 **Concurrency-keyed reserve throughput on large queues**
