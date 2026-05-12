@@ -589,6 +589,26 @@ fn read_header(data: &[u8]) -> Result<(u32, u32), WalError> {
     Ok((version, flags))
 }
 
+/// Human-readable byte size for log lines. Picks the largest binary
+/// prefix where the value would render with a meaningful integer part.
+pub(crate) fn format_bytes(n: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
+    if n >= TIB {
+        format!("{:.2} TiB", n as f64 / TIB as f64)
+    } else if n >= GIB {
+        format!("{:.2} GiB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.1} MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.1} KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{} B", n)
+    }
+}
+
 // --- WAL file management ---
 
 struct WalFile {
@@ -1122,7 +1142,14 @@ impl Wal {
         self.alive_bytes = 0;
         self.reserved_bytes = 0;
 
-        for (seq, path) in &file_infos {
+        let total_segments = file_infos.len();
+        let total_bytes = self.total_disk_bytes;
+        let mut bytes_done: u64 = 0;
+        let replay_started = Instant::now();
+        let mut last_log = replay_started;
+        const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+        for (idx, (seq, path)) in file_infos.iter().enumerate() {
             let data = match fs::read(path) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1257,6 +1284,29 @@ impl Wal {
                         break;
                     }
                 }
+            }
+
+            bytes_done = bytes_done.saturating_add(data.len() as u64);
+            let segments_done = idx + 1;
+            // Throttle: log every PROGRESS_INTERVAL, plus always log the
+            // final segment so the operator sees a clear "done" marker
+            // before the post-replay integrity passes start.
+            if last_log.elapsed() >= PROGRESS_INTERVAL || segments_done == total_segments {
+                let pct = if total_bytes > 0 {
+                    (bytes_done as f64 / total_bytes as f64 * 100.0) as u32
+                } else {
+                    100
+                };
+                tracing::info!(
+                    "WAL replay: segment {}/{}, {} / {} ({}%), {} jobs so far",
+                    segments_done,
+                    total_segments,
+                    format_bytes(bytes_done),
+                    format_bytes(total_bytes),
+                    pct,
+                    jobs.len(),
+                );
+                last_log = Instant::now();
             }
         }
 

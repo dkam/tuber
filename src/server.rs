@@ -3065,6 +3065,7 @@ fn build_state(
         // existing operators upgrading without TOAST data see an empty
         // index, which is correct.
         let toast_dir = dir.join("toast");
+        tracing::info!("TOAST: scanning body store at {:?}", toast_dir);
         let body_store = Arc::new(BodyStore::open(
             &toast_dir,
             crate::body_store::DEFAULT_SEGMENT_SIZE,
@@ -3072,7 +3073,12 @@ fn build_state(
 
         let on_disk = wal.total_disk_bytes();
 
-        tracing::info!("WAL: replaying {} bytes from {:?}", on_disk, dir);
+        tracing::info!(
+            "WAL: replaying {} segments / {} from {:?} (not yet accepting connections)",
+            wal.file_count(),
+            crate::wal::format_bytes(on_disk),
+            dir,
+        );
         let (mut jobs, next_id, tombstones, orphan_bodies) = wal.replay()?;
         let job_count = jobs.len();
         let tombstone_count = tombstones.len();

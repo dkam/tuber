@@ -26,8 +26,10 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::job::BodyId;
+use crate::wal::format_bytes;
 
 // --- Constants ---
 
@@ -185,7 +187,20 @@ impl BodyStore {
         let mut total_bytes_acc: u64 = 0;
         let mut live_bytes_acc: u64 = 0;
 
-        for seq in &seqs {
+        // Total on-disk size up-front so the progress log can show a
+        // percentage. One stat per segment is cheap relative to the
+        // header walk that follows.
+        let total_disk: u64 = seqs
+            .iter()
+            .filter_map(|seq| fs::metadata(segment_path(dir, *seq)).ok())
+            .map(|m| m.len())
+            .sum();
+        let total_segments = seqs.len();
+        let scan_started = Instant::now();
+        let mut last_log = scan_started;
+        const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+        for (idx, seq) in seqs.iter().enumerate() {
             let path = segment_path(dir, *seq);
             let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
             let scan = scan_segment(&mut file)?;
@@ -204,6 +219,25 @@ impl BodyStore {
                 *seq,
                 Segment { file: Arc::new(file), total_bytes: scan.consumed, live_bytes },
             );
+
+            let segments_done = idx + 1;
+            if last_log.elapsed() >= PROGRESS_INTERVAL || segments_done == total_segments {
+                let pct = if total_disk > 0 {
+                    (total_bytes_acc as f64 / total_disk as f64 * 100.0) as u32
+                } else {
+                    100
+                };
+                tracing::info!(
+                    "TOAST scan: segment {}/{}, {} / {} ({}%), {} bodies indexed",
+                    segments_done,
+                    total_segments,
+                    format_bytes(total_bytes_acc),
+                    format_bytes(total_disk),
+                    pct,
+                    index.len(),
+                );
+                last_log = Instant::now();
+            }
         }
 
         let next_seq = seqs.last().map(|s| s + 1).unwrap_or(0);
