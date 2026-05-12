@@ -1,5 +1,13 @@
 # Changes
 
+## v0.6.4
+
+**`stats-group` per-state member counters**
+
+`stats-group <name>` now returns `ready`, `reserved`, `delayed`, `buried`, and `waiting-jobs` in place of the old `pending`/`buried`/`complete` triplet — bringing the response in line with the rest of the stats family and giving operators an immediate view of where a group's members are stuck without crossing to `stats-job`. Counters are computed by scanning live jobs at query time, so state-transition sites don't need new bookkeeping. Field names are intentionally bare (no `current-jobs-` prefix); `stats-group` is a tuber extension with no beanstalkd-client compatibility surface to preserve.
+
+Note: this is a breaking change for any tool that parses the `stats-group` YAML for `pending` or `complete`. The deferred `grp:<name>:<ttl>` cooldown design that would have added `cooldown-remaining` is filed under `docs/future/grp-ttl-cooldown.md` and not implemented in this release.
+
 ## v0.6.3
 
 **Startup visibility: WAL/TOAST replay progress logs**
