@@ -1285,9 +1285,10 @@ fn test_stats_group_pending() {
         Response::Ok(data) => {
             let yaml = String::from_utf8(data).unwrap();
             assert!(yaml.contains("name: \"g1\""), "yaml: {}", yaml);
-            assert!(yaml.contains("pending: 1"), "yaml: {}", yaml);
+            assert!(yaml.contains("ready: 1"), "yaml: {}", yaml);
+            assert!(yaml.contains("reserved: 0"), "yaml: {}", yaml);
+            assert!(yaml.contains("delayed: 0"), "yaml: {}", yaml);
             assert!(yaml.contains("buried: 0"), "yaml: {}", yaml);
-            assert!(yaml.contains("complete: false"), "yaml: {}", yaml);
             assert!(yaml.contains("waiting-jobs: 0"), "yaml: {}", yaml);
         }
         _ => panic!("expected Ok, got {:?}", resp),
@@ -1451,9 +1452,10 @@ fn test_stats_group_buried() {
     match resp {
         Response::Ok(data) => {
             let yaml = String::from_utf8(data).unwrap();
-            assert!(yaml.contains("pending: 1"), "yaml: {}", yaml);
+            assert!(yaml.contains("ready: 0"), "yaml: {}", yaml);
+            assert!(yaml.contains("reserved: 0"), "yaml: {}", yaml);
+            assert!(yaml.contains("delayed: 0"), "yaml: {}", yaml);
             assert!(yaml.contains("buried: 1"), "yaml: {}", yaml);
-            assert!(yaml.contains("complete: false"), "yaml: {}", yaml);
         }
         _ => panic!("expected Ok, got {:?}", resp),
     }

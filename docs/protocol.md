@@ -134,7 +134,7 @@ Statistics for a job group (used with `grp:`/`aft:` features).
 
 Response: `OK <bytes>\r\n<yaml>\r\n` or `NOT_FOUND\r\n`
 
-YAML fields: `name`, `pending`, `buried`, `complete`, `waiting-jobs`.
+YAML fields: `name`, `ready`, `reserved`, `delayed`, `buried`, `waiting-jobs`.
 
 ### list-tubes\r\n / list-tube-used\r\n / list-tubes-watched\r\n
 

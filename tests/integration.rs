@@ -4428,12 +4428,17 @@ async fn test_group_idempotency_duplicate() {
     c.mustsend("second\r\n").await;
     c.ckresp("INSERTED 1 READY\r\n").await;
 
-    // stats-group should show pending: 1 (not 2)
+    // stats-group should show one ready member (the dup did not create a 2nd)
     c.mustsend("stats-group batch\r\n").await;
     let body = c.read_ok_body().await;
     assert!(
-        body.contains("pending: 1"),
-        "expected pending: 1, got: {:?}",
+        body.contains("ready: 1"),
+        "expected ready: 1, got: {:?}",
+        body
+    );
+    assert!(
+        !body.contains("ready: 2"),
+        "duplicate should not have created a 2nd member, got: {:?}",
         body
     );
 }

@@ -2299,17 +2299,32 @@ impl ServerState {
             None => return Response::NotFound,
         };
 
+        let (mut ready, mut reserved, mut delayed, mut buried) = (0u64, 0u64, 0u64, 0u64);
+        for job in self.jobs.values() {
+            if job.group.as_deref() != Some(group_name) {
+                continue;
+            }
+            match job.state {
+                JobState::Ready => ready += 1,
+                JobState::Reserved => reserved += 1,
+                JobState::Delayed => delayed += 1,
+                JobState::Buried => buried += 1,
+            }
+        }
+
         let yaml = format!(
             "---\n\
              name: \"{}\"\n\
-             pending: {}\n\
+             ready: {}\n\
+             reserved: {}\n\
+             delayed: {}\n\
              buried: {}\n\
-             complete: {}\n\
              waiting-jobs: {}\n",
             group_name,
-            gs.pending,
-            gs.buried,
-            gs.is_complete(),
+            ready,
+            reserved,
+            delayed,
+            buried,
             gs.waiting_jobs.len(),
         );
         Response::Ok(yaml.into_bytes())

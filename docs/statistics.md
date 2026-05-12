@@ -184,15 +184,25 @@ Returns per-job statistics in YAML format.
 
 ## Group Stats (`stats-group <name>`)
 
-Returns group state in YAML format.
+Returns group state in YAML format. Returns `NOT_FOUND` if no member or
+dependent has ever referenced the group, or if every member has been
+deleted and there are no `aft:` waiters left (groups are reaped the
+moment they go idle).
 
 | Field | Description |
 |---|---|
 | `name` | Group name |
-| `pending` | Jobs in the group not yet deleted |
-| `buried` | Buried jobs in the group (block completion) |
-| `complete` | Whether all jobs in the group have been deleted |
-| `waiting-jobs` | Number of `aft:` jobs waiting for this group |
+| `ready` | Members currently in the ready queue |
+| `reserved` | Members currently reserved by a worker |
+| `delayed` | Members currently delayed |
+| `buried` | Members currently buried (block group completion) |
+| `waiting-jobs` | `aft:` jobs held until this group completes |
+
+`ready/reserved/delayed/buried` are computed by scanning live jobs at
+query time, so they always reflect current state without depending on
+counter bookkeeping at every transition. Field names are intentionally
+bare (no `current-jobs-` prefix) since `stats-group` is a tuber
+extension and has no beanstalkd-client compatibility surface.
 
 ## Prometheus Metrics
 
