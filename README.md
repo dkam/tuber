@@ -21,113 +21,67 @@ Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beansta
 
 ### Feature Comparison
 
-| Feature | Tuber | Beanstalkd | Sidekiq + Redis | GoodJob | Solid Queue | RabbitMQ |
-|---|---|---|---|---|---|---|
-| **Unique / idempotent jobs** | Yes | — | Enterprise only ¹ | Yes | Yes ² | — ³ |
-| **Concurrency control** | Yes (per-key) | — | Enterprise only ¹ | Yes | Yes | — |
-| **Job groups / DAG pipelines** | Yes | — | Pro only ¹ | Batches only ⁴ | — | — |
-| **Weighted queues** | Yes | — | Yes | — | — | — |
-| **Per-job priority** | Yes (numeric) | Yes (numeric) | — ⁵ | Yes | Yes | Yes |
-| **Delayed jobs** | Yes | Yes | Yes | Yes | Yes | Via plugin |
-| **Batch reserve / delete** | Yes | — | — | — | — | Prefetch |
-| **Memory backpressure** | Yes ¹⁰ | — | Redis `maxmemory` ¹¹ | DB limits | DB limits | Memory alarms ¹² |
-| **Processing time stats** | EWMA + p50/p95/p99 | — | Histogram ⁷ | In DB ⁸ | — | — |
-| **Queue latency stats** | EWMA + min/max | — | Oldest only ⁹ | In DB ⁸ | — | — |
-| **Persistence** | WAL (optional) | WAL (optional) | Redis RDB/AOF | PostgreSQL | DB ⁶ | Durable queues |
-| **Infrastructure** | None (single binary) | None (single binary) | Redis | PostgreSQL | DB ⁶ | Erlang runtime |
+| Feature | Tuber | Beanstalkd | Sidekiq + Redis | BullMQ | GoodJob | Solid Queue | RabbitMQ |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **Unique / idempotent jobs** | Yes | — | Pro/Enterprise ¹ | Yes | Yes | Yes ² | — ³ |
+| **Concurrency control** | Yes (per-key) | — | Enterprise ¹ | Yes (rate limit) | Yes | Yes | — |
+| **Fan-in batches** | Yes | — | Pro ¹ | Yes (flows) | Yes ⁴ | — | — |
+| **Multi-stage DAG pipelines** | Yes | — | — | Yes (flows) | — ⁴ | — | — |
+| **Weighted queues** | Yes | — | Yes | — | — | — | — |
+| **Per-job priority** | Yes (numeric) | Yes (numeric) | — ⁵ | Yes | Yes | Yes | Yes |
+| **Delayed jobs** | Yes | Yes | Yes | Yes | Yes | Yes | Via plugin |
+| **Batch reserve / delete** | Yes | — | — | — | — | — | Prefetch |
+| **Memory backpressure** | Yes ¹⁰ | — | Redis `maxmemory` ¹¹ | Redis `maxmemory` ¹¹ | DB limits | DB limits | Memory alarms ¹² |
+| **Processing time stats** | EWMA + p50/p95/p99 | — | Histogram ⁷ | Metrics events | In DB ⁸ | — | — |
+| **Queue latency stats** | EWMA + min/max | — | Oldest only ⁹ | Oldest only ⁹ | In DB ⁸ | — | — |
+| **Persistence** | WAL, ~100ms fsync | WAL, ~100ms fsync | Redis RDB/AOF | Redis RDB/AOF | PostgreSQL | DB ⁶ | Durable queues |
+| **Infrastructure** | None (single binary) | None (single binary) | Redis | Redis | PostgreSQL | DB ⁶ | Erlang runtime |
 
-<sub>¹ Sidekiq's unique jobs, concurrency controls, and batches require [paid tiers](https://sidekiq.org) (Pro/Enterprise). The OSS version has queue weights and basic job processing.<br>
-² Solid Queue unique jobs available from Rails 7.2+.<br>
-³ RabbitMQ has a community deduplication plugin, but no built-in uniqueness.<br>
-⁴ GoodJob batches support single-level fan-out/fan-in (enqueue N jobs, fire a callback when all complete). Multi-stage pipelines require manually chaining batches inside callbacks.<br>
-⁵ Sidekiq uses queue-level ordering (strict or weighted), not per-job numeric priority.<br>
-⁶ Solid Queue supports SQLite, PostgreSQL, or MySQL.<br>
-⁷ Sidekiq 7+ tracks execution time per job class in exponential histogram buckets. No percentiles without external APM.<br>
-⁸ GoodJob stores timestamps in PostgreSQL — you can query for percentiles with SQL, but nothing is computed or displayed by default.<br>
-⁹ Sidekiq's `Queue#latency` returns the age of the oldest job only, not a distribution. SQS has a similar `ApproximateAgeOfOldestMessage`.<br>
-¹⁰ Tuber's `--max-jobs-size` rejects new `put` commands with `OUT_OF_MEMORY` when the budget is full, but workers can always reserve, release, bury, kick, and delete — the queue keeps draining even at capacity.<br>
-¹¹ Redis `maxmemory` with an eviction policy can drop data silently. With `noeviction`, writes fail but Sidekiq has no built-in handling — workers stall on Redis errors.<br>
-¹² RabbitMQ blocks publishers when memory or disk alarms fire, but also blocks consumers on the same connection — a full queue can prevent workers from ACKing messages, causing a deadlock. Tuber's design avoids this by only gating `put`.</sub>
-
-## What Can You Do With It?
-
-### Background jobs
-
-Offload slow work from your web app. Your request handler queues a job and returns immediately — workers process it in the background.
-
-These examples use shell commands for clarity, but in practice you'd typically interact with the queue programmatically via a client library.
-
-```bash
-tuber put -t emails "send-welcome user@example.com"
-tuber put -t thumbnails "resize /uploads/photo.jpg 200x200"
-
-# Workers process jobs in the background
-tuber work -t emails -j 4 &
-tuber work -t thumbnails -j 2 &
-```
-
-### Task pipelines
-
-Chain stages together with job groups. Import rows in parallel, then fire a follow-up when they're all done.
-
-```bash
-tuber put -g import "./import.sh row1"
-tuber put -g import "./import.sh row2"
-tuber put -g import "./import.sh row3"
-tuber put --aft import "./send-summary.sh"
-```
-
-### Rate-limited processing
-
-Use concurrency keys to ensure only one job per key is processed at a time. Different keys run in parallel.
-
-```bash
-# One deploy per host at a time, but different hosts in parallel
-tuber put -c "web1" "./deploy.sh web1"
-tuber put -c "web1" "./deploy.sh web1"   # queued until first finishes
-tuber put -c "web2" "./deploy.sh web2"   # runs in parallel — different key
-```
-
-### Distributed cron
-
-Running the same cron on multiple hosts? Idempotency keys prevent duplicate work.
-
-```bash
-# Safe to call from multiple cron hosts — only one job created
-tuber put -i "nightly-report:300" "./generate-report.sh"
-```
-
-### Shell task runner
-
-`tuber put` + `tuber work` is a simple distributed task runner. Queue shell commands, and workers execute them.
-
-```bash
-tuber server &
-tuber work -j 4 &
-
-tuber put "echo 'hello world'"
-tuber put "curl -s https://example.com/api/webhook -d '{\"event\": \"done\"}'"
-tuber put -i "transcode-42" "ffmpeg -i /data/video-42.raw -c:v libx264 /data/video-42.mp4"
-```
+<sub>¹ Sidekiq OSS has queue weights and basic job processing. Unique jobs and batches require [Pro](https://sidekiq.org/products/pro.html); concurrency controls require [Enterprise](https://sidekiq.org/products/enterprise.html).</sub>
+<sub>² Solid Queue unique jobs available from Rails 7.2+.</sub>
+<sub>³ RabbitMQ has a community deduplication plugin, but no built-in uniqueness.</sub>
+<sub>⁴ GoodJob batches support single-level fan-out/fan-in (enqueue N jobs, fire a callback when all complete). Multi-stage pipelines require manually chaining batches inside callbacks. BullMQ flows support arbitrary DAGs natively.</sub>
+<sub>⁵ Sidekiq uses queue-level ordering (strict or weighted), not per-job numeric priority.</sub>
+<sub>⁶ Solid Queue supports SQLite, PostgreSQL, or MySQL.</sub>
+<sub>⁷ Sidekiq 7+ tracks execution time per job class in exponential histogram buckets. No percentiles without external APM.</sub>
+<sub>⁸ GoodJob stores timestamps in PostgreSQL — you can query for percentiles with SQL, but nothing is computed or displayed by default.</sub>
+<sub>⁹ `Queue#latency` and BullMQ's queue age return the age of the oldest job only, not a distribution. SQS has a similar `ApproximateAgeOfOldestMessage`.</sub>
+<sub>¹⁰ Tuber's `--max-jobs-size` rejects new `put` commands with `OUT_OF_MEMORY` when the budget is full, but workers can always reserve, release, bury, kick, and delete — the queue keeps draining even at capacity.</sub>
+<sub>¹¹ Redis `maxmemory` with an eviction policy can drop data silently. With `noeviction`, writes fail but workers have no built-in handling — they stall on Redis errors.</sub>
+<sub>¹² RabbitMQ blocks publishers when memory or disk alarms fire, but also blocks consumers on the same connection — a full queue can prevent workers from ACKing messages, causing a deadlock. Tuber's design avoids this by only gating `put`.</sub>
 
 ## Features
 
-All the great hits — priority queues, delayed jobs, TTR, named tubes, bury & kick — plus idempotency, concurrency keys, job groups, weighted reserve, and batch operations.
+### Storage architecture
 
-### Core
+Tuber's defining design choice is splitting job storage between RAM and disk. Job *metadata* (state, priority, timing, tags) lives in RAM for fast reserve/release/delete. Job *bodies* — usually the largest part — live on disk in an append-only body store, addressed by an opaque `BodyId` in the WAL.
 
-- **Priority queues** — lower priority number = more urgent. Jobs with priority < 1024 are considered "urgent".
-- **Delayed jobs** — submit a job now, make it available after a delay.
-- **Time-to-run (TTR)** — if a worker doesn't finish within TTR seconds, the job goes back to ready.
-- **Named tubes** — organise jobs into separate queues. Default tube is `default`.
-- **Bury & kick** — set aside problem jobs for later inspection, then kick them back to ready.
-- **Peek** — inspect jobs without reserving them. Peek by ID, or peek at the next ready/delayed/buried job.
+- **Per-job RAM cost is ~512 bytes regardless of body size.** A 1 MB job uses the same RAM as a 1 KB job. In practice, 1058 active jobs with 1 MB bodies cost ~1 GiB on disk and ~540 KB in RAM — roughly 2000× more capacity at the same RAM budget vs. an in-memory queue. The queue scales by job *count*, not job *size*.
+- **Cheap fsyncs.** Because WAL records only carry metadata plus a body reference, the latency-critical WAL fsync flushes a constant ~100 bytes per record. fsync overhead stays flat as body size grows.
+- **Optional persistence.** Pass `-b <dir>` to enable the WAL + body store. Without it, tuber runs fully in-memory and loses state on restart — fine for ephemeral workloads.
+- **Replay-aware readiness.** When persistence is on, tuber binds the listener *only after* WAL replay completes. Connect-refused during replay, accepting once ready. Docker's `HEALTHCHECK` and external TCP probes get an accurate signal even on a multi-minute replay. See [Readiness & Health Checks](#readiness--health-checks).
+
+### Job semantics
+
+The beanstalkd primitives, intact:
+
+- **Priority queues** — lower priority number = more urgent. Priority < 1024 is "urgent."
+- **Delayed jobs** — submit now, become available after a delay.
+- **Time-to-run (TTR)** — if a worker doesn't finish within TTR seconds, the job returns to ready.
+- **Named tubes** — separate queues, default is `default`.
+- **Bury & kick** — set aside problem jobs, kick them back to ready when fixed.
+- **Peek** — inspect jobs without reserving them.
 - **Pause** — temporarily stop a tube from serving jobs.
-- **Persistence with split storage** — optional write-ahead log (`-b` flag) for crash recovery, with job bodies stored separately from metadata in an append-only body store. The WAL stays small (records carry just metadata + a body reference), so fsyncs are cheap regardless of body size. Bodies live on disk and stream into worker responses on demand.
-- **Large job bodies, tiny RAM** — because bodies live on disk, the in-memory cost per job is ~512 bytes regardless of body size. A 1 MB job uses the same RAM as a 1 KB job. Real-world numbers: 1058 active jobs × 1 MB bodies = ~1 GiB on disk, ~540 KB in RAM (~2000× more 1 MB jobs at the same RAM budget vs. an in-memory queue). The queue scales by job *count*, not job *size*.
-- **Memory budget** — `--max-jobs-size` caps in-memory job footprint (metadata + idempotency tombstones when persistence is on; full job bytes when it isn't). PUT returns `OUT_OF_MEMORY` when the budget is exhausted, giving producers an explicit backpressure signal instead of a silent OOM kill. Workers can always reserve, release, bury, kick, and delete — state transitions never fail due to the budget. Stats (`current-jobs-size`, `max-jobs-size`) and Prometheus gauges (`tuber_jobs_size_bytes`, `tuber_jobs_size_limit_bytes`) let you alert before the budget fills up. The budget also applies at startup: tuber aborts with a diagnostic error rather than OOMing mid-replay.
-- **Storage budget** — `--max-storage-bytes` (mandatory with `-b`) caps the combined WAL + body-store footprint on disk. PUT returns `OUT_OF_STORAGE` once exceeded; state changes always succeed because tuber reserves one WAL segment's headroom for delete/release/bury/kick records. No more silent disk-fill outages.
-- **Prometheus metrics** — expose a `/metrics` endpoint for monitoring. See [Statistics Reference](docs/statistics.md#prometheus-metrics).
+
+Plus tuber's extensions — see [Unique Jobs](#unique-jobs-idempotency), [Job Dependencies](#job-dependencies-fan-out--fan-in), [Concurrency Keys](#concurrency-keys), [Weighted Reserve](#weighted-reserve), and [Batch Operations](#batch-operations).
+
+### Operations
+
+- **Memory budget** — `--max-jobs-size` caps in-memory job footprint (metadata + idempotency tombstones with persistence on; full job bytes without). PUT returns `OUT_OF_MEMORY` when exhausted — explicit backpressure instead of a silent OOM kill. Workers can always reserve, release, bury, kick, and delete; state transitions never fail due to the budget. The cap also applies at startup, so tuber aborts with a diagnostic instead of OOMing mid-replay.
+- **Storage budget** — `--max-storage-bytes` (mandatory with `-b`) caps WAL + body-store disk usage. PUT returns `OUT_OF_STORAGE` once exceeded; state changes always succeed because tuber reserves one WAL segment's headroom for delete/release/bury/kick records. No silent disk-fill outages.
+- **Per-tube statistics** — EWMA processing time split at a 100ms threshold (fast vs. slow buckets), p50/p95/p99 percentiles from the last 1000 samples, queue-time EWMA, bury rate. Available via `stats-tube`, the Prometheus `/metrics` endpoint, and [tuber-tui](https://github.com/tuberq/tuber-tui). See the [Statistics Reference](docs/statistics.md).
+- **Prometheus metrics** — `/metrics` endpoint with gauges for queue depth, memory/storage budgets, and per-tube counters.
+- **Drain mode** — `drain` (or `SIGUSR1`) rejects new puts with `DRAINING` while letting workers finish in-flight jobs. `undrain` resumes.
 
 ### Readiness & Health Checks
 
@@ -304,6 +258,23 @@ A buried job blocks group completion (`complete: false`). Kick it to let the gro
 
 Group names are global — jobs in the same group can span multiple tubes. Note that the server does not detect cycles: if two groups depend on each other, the waiting jobs will be held indefinitely. Cycle avoidance is the client's responsibility.
 
+
+
+```text
+stats-group import
+→ OK <bytes>
+---
+name: "import"
+ready: 0
+reserved: 0
+delayed: 0
+buried: 0
+waiting-jobs: 0
+cooldown-remaining: 247
+```
+
+After the cooldown expires, the group is removed and `stats-group` returns `NOT_FOUND`.
+
 ### Concurrency Keys
 
 Limit parallel processing of related jobs. When a job with a `con:` key is reserved, other ready jobs sharing the same key are hidden from `reserve` until the reservation ends (via delete, release, bury, TTR timeout, or disconnect):
@@ -362,7 +333,13 @@ delete-batch 1 2 3 99
 
 Returns `DELETED_BATCH <deleted_count> <not_found_count>` — here 3 jobs were deleted and 1 was not found.
 
-## As A Workqueue for the Shell
+## Using Tuber from the Shell
+
+`tuber put` and `tuber work` make tuber usable as a distributed shell task runner — no client library required. Queue commands as strings, workers execute them as shell commands. Handy for cron-like workloads, batch jobs, ad-hoc pipelines, and driving tuber during development or debugging.
+
+For application integration, use a [beanstalkd client library](https://github.com/beanstalkd/beanstalkd/wiki/Client-Libraries) in your language of choice — tuber speaks the beanstalkd wire protocol.
+
+### Basics
 
 ```bash
 # Start the server
@@ -384,13 +361,58 @@ tuber tubes
 tuber stats
 ```
 
-## Installation
+### Background jobs across tubes
 
-### Homebrew
+Organise different kinds of work into separate tubes and run workers per tube.
 
 ```bash
-brew tap tuberq/tuber
-brew install tuber
+tuber put -t emails "send-welcome user@example.com"
+tuber put -t thumbnails "resize /uploads/photo.jpg 200x200"
+
+# Workers process jobs in the background
+tuber work -t emails -j 4 &
+tuber work -t thumbnails -j 2 &
+```
+
+### Task pipelines
+
+Chain stages together with job groups. Import rows in parallel, then fire a follow-up when they're all done.
+
+```bash
+tuber put -g import "./import.sh row1"
+tuber put -g import "./import.sh row2"
+tuber put -g import "./import.sh row3"
+tuber put --aft import "./send-summary.sh"
+```
+
+### Distributed cron
+
+Running the same cron on multiple hosts? Idempotency keys prevent duplicate work — whichever host enqueues first wins, the rest dedup.
+
+```bash
+# Safe to call from multiple cron hosts — only one job created
+tuber put -i "nightly-report:300" "./generate-report.sh"
+```
+
+### Rate-limited processing
+
+Use concurrency keys to ensure only one job per key is processed at a time. Different keys run in parallel.
+
+```bash
+# One deploy per host at a time, but different hosts in parallel
+tuber put -c "web1" "./deploy.sh web1"
+tuber put -c "web1" "./deploy.sh web1"   # queued until first finishes
+tuber put -c "web2" "./deploy.sh web2"   # runs in parallel — different key
+```
+
+### One-off mixed work
+
+```bash
+tuber server &
+tuber work -j 4 &
+
+tuber put "curl -s https://example.com/api/webhook -d '{\"event\": \"done\"}'"
+tuber put -i "transcode-42" "ffmpeg -i /data/video-42.raw -c:v libx264 /data/video-42.mp4"
 ```
 
 ### Cargo
