@@ -196,8 +196,7 @@ impl BodyStore {
             .map(|m| m.len())
             .sum();
         let total_segments = seqs.len();
-        let scan_started = Instant::now();
-        let mut last_log = scan_started;
+        let mut last_log = Instant::now();
         const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
         for (idx, seq) in seqs.iter().enumerate() {

@@ -1,5 +1,22 @@
 # Changes
 
+## v0.6.3
+
+**Startup visibility: WAL/TOAST replay progress logs**
+
+A 20 GB WAL replay used to be a silent multi-minute window between the "WAL: replaying N bytes" line and the post-replay summary. Now both `Wal::replay` and `BodyStore::open` emit segment-boundary progress lines, time-throttled to one every ~5 s, showing bytes processed, percent done, and a live job/body count:
+
+```text
+TOAST: scanning body store at "/var/lib/tuber/binlog/toast"
+TOAST scan: segment 87/320, 5.43 GiB / 19.84 GiB (27%), 412384 bodies indexed
+WAL: replaying 1247 segments / 12.18 GiB from "/var/lib/tuber/binlog" (not yet accepting connections)
+WAL replay: segment 412/1247, 4.01 GiB / 12.18 GiB (32%), 891204 jobs so far
+…
+WAL: replayed 2480915 jobs and 1289 idempotency tombstones from "/var/lib/tuber/binlog"
+```
+
+Also documents the v0.4.2 readiness contract in the README: the beanstalk TCP listener is bound only after replay completes, so the existing `Dockerfile` HEALTHCHECK (`tuber stats`) is an honest readiness probe — fails during replay, succeeds after. No new HTTP endpoint; doing so would re-introduce the false-healthy window v0.4.2 closed.
+
 ## v0.6.2
 
 **`stats-tube` head-of-queue ages for starvation triage**

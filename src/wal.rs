@@ -1145,8 +1145,7 @@ impl Wal {
         let total_segments = file_infos.len();
         let total_bytes = self.total_disk_bytes;
         let mut bytes_done: u64 = 0;
-        let replay_started = Instant::now();
-        let mut last_log = replay_started;
+        let mut last_log = Instant::now();
         const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
         for (idx, (seq, path)) in file_infos.iter().enumerate() {
@@ -1288,9 +1287,8 @@ impl Wal {
 
             bytes_done = bytes_done.saturating_add(data.len() as u64);
             let segments_done = idx + 1;
-            // Throttle: log every PROGRESS_INTERVAL, plus always log the
-            // final segment so the operator sees a clear "done" marker
-            // before the post-replay integrity passes start.
+            // Always log the final segment so operators see a clear "done"
+            // marker before the post-replay integrity passes start.
             if last_log.elapsed() >= PROGRESS_INTERVAL || segments_done == total_segments {
                 let pct = if total_bytes > 0 {
                     (bytes_done as f64 / total_bytes as f64 * 100.0) as u32

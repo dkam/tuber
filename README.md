@@ -1,22 +1,23 @@
 # tuber
 
-An experimental, simple, fast job queue server. One binary, zero dependencies.
+A simple, fast job queue server. One binary, zero dependencies. Running in production at [Booko.au](https://booko.au) where it's already procesed jobs in the tens of millions, and newly available in [Splat](https://github.com/dkam/splat).
 
-Tuber is a re-write of Beanstalkd in Rust, it brings along priority queues, delayed jobs, job reservations, named tubes — and adds unique jobs, concurrency control, job group pipelines, batch operations and weighted queues.
+Tuber is a re-write of Beanstalkd in Rust. It brings along priority queues, delayed jobs, job reservations, and named tubes — and adds unique jobs, concurrency control, job group pipelines, batch operations, weighted queues, and offloaded job bodies.
 
 [![tuber-tui](screenshots/tui.png)](https://github.com/tuberq/tuber-rs)
 *[tuber-tui](https://github.com/tuberq/tuber-rs) — a terminal dashboard compatible with both Tuber and Beanstalkd.*
 
-
 ## Why Tuber?
 
-Redis-backed queues are popular and performant, but Redis isn't a natural fit for job queues. You're bolting priorities, delays, reservations, and timeouts onto a general-purpose data structure server — complexity that grows with every edge case.
+Job queues today fall into two camps, and both make compromises.
 
-SQLite-backed queues are simple and fast, but limited to a single host. PostgreSQL and MySQL-backed queues can scale beyond one host, but a job queue should be separate from your application database for capacity planning — which means another instance to manage with connection pooling, tuning, vacuuming, backups, and restores.
+**RAM-based queues** — Redis-backed Sidekiq (Ruby), BullMQ (Node), Celery and RQ (Python), Faktory, and Beanstalkd itself — are fast, but every job lives in memory. Your queue depth is capped by host RAM, and a backlog of jobs with large payloads can push you into swap or OOM. Redis adds a second problem: it's a general-purpose data store, not a queue, so priorities, delays, reservations, and timeouts are bolted on with complexity growing at every edge case.
 
-Tuber is purpose-built for this. A single binary, easy to deploy in Docker, with optional write-ahead log for durability. No capacity planning, no tuning, no surprises. Workers wait efficiently at any scale.
+**Disk-based queues** — Solid Queue and GoodJob (Ruby), pg-boss (Node), Procrastinate (Python), River (Go) — solve the capacity problem by piggybacking on your relational database, but the queue workload is a bad fit for MVCC storage engines. High-churn job tables generate dead tuples faster than autovacuum can reclaim them, indexes bloat, and dequeue queries (`FOR UPDATE SKIP LOCKED`) get slower as the backlog grows. You also inherit the operational weight of the database — connection pooling, tuning, vacuuming, backups — and either share capacity with your application or run a second instance.
 
-Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beanstalkd), so [dozens of client libraries](https://github.com/beanstalkd/beanstalkd/wiki/Client-Libraries) already work out of the box. For Tuber's extended features (idempotency, job groups, concurrency keys), see the [beaneater tuber fork](https://github.com/tuberq/beaneater/tree/tuber) for Ruby.
+**Tuber takes both.** Metadata stays in RAM for fast reserve/release/delete, backed by an optional write-ahead log for durability. Job bodies are offloaded to disk using a TOAST-style scheme (inspired by PostgreSQL), so memory usage stays bounded regardless of payload size or queue depth. You get RAM-speed coordination with disk-scale capacity, in a single binary with no database to tune.
+
+Tuber is wire-compatible with [beanstalkd](https://github.com/beanstalkd/beanstalkd), so [dozens of client libraries](https://github.com/beanstalkd/beanstalkd/wiki/Client-Libraries) work out of the box across every major language. For Tuber's extended features (idempotency, job groups, concurrency keys), see the [beaneater tuber fork](https://github.com/tuberq/beaneater/tree/tuber) for Ruby.
 
 ### Feature Comparison
 
