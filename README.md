@@ -7,39 +7,6 @@ Tuber is a re-write of Beanstalkd in Rust, it brings along priority queues, dela
 [![tuber-tui](screenshots/tui.png)](https://github.com/tuberq/tuber-rs)
 *[tuber-tui](https://github.com/tuberq/tuber-rs) — a terminal dashboard compatible with both Tuber and Beanstalkd.*
 
-## How was this built?
-
-Every line of Rust in this project was written by Claude Opus 4.6. The architecture, testing strategy, and design decisions were human-driven.  I program in Ruby, I have programmed in C, Java and PHP - I have never programmed in Rust.
-
-I used Beanstalkd's C source code and tests as the foundation, first building a minimal working version, duplicating the tests, then incrementally adding the new extensions.
-
-The docs/ directory contains the working files we used to plan and describe the implementation.
-
-I use Beanstalkd in [Booko](https://booko.au) in several places requiring queues.  It's working very well.  Claude Code can use the tuber-cli to interact with the queue, finding buried (failed) jobs, which helps with debugging. 
-
-Read more about it [on my blog](https://da.nmilne.com/shipping-a-job-queue-system-without-reading-the-source-code/).
-
-## Quick Start
-
-```bash
-# Start the server
-tuber server
-
-# Put a job
-tuber put "echo hello world"
-
-# Put jobs from stdin (one per line)
-echo -e "job1\njob2\njob3" | tuber put
-
-# Process jobs (reserves and runs each job body as a shell command)
-tuber work
-
-# List tubes
-tuber tubes
-
-# Check stats
-tuber stats
-```
 
 ## Why Tuber?
 
@@ -161,6 +128,27 @@ All the great hits — priority queues, delayed jobs, TTR, named tubes, bury & k
 - **Storage budget** — `--max-storage-bytes` (mandatory with `-b`) caps the combined WAL + body-store footprint on disk. PUT returns `OUT_OF_STORAGE` once exceeded; state changes always succeed because tuber reserves one WAL segment's headroom for delete/release/bury/kick records. No more silent disk-fill outages.
 - **Prometheus metrics** — expose a `/metrics` endpoint for monitoring. See [Statistics Reference](docs/statistics.md#prometheus-metrics).
 
+### Readiness & Health Checks
+
+When persistence is on (`-b`), tuber binds the beanstalk TCP listener **only after WAL replay completes**. The port being reachable is the readiness signal — connect-refused during replay, accepting once ready. This makes false-healthy windows during a slow restart impossible, which matters when a 20 GB+ WAL can take minutes to replay.
+
+- **Docker:** the published image ships `HEALTHCHECK ["tuber", "stats"]`. The check fails (connection refused) during replay and passes once the listener is up. Docker reports `starting` → `unhealthy` → `healthy` across a slow restart.
+- **External monitors (Uptime Kuma, etc.):** point them at the beanstalk port (default `11300`) with a TCP-connect probe, or run `tuber stats` via `docker exec`. Don't probe the metrics port (`9100`) with TCP-only — `/metrics` is served by the same process but exists for Prometheus scrapes, not readiness.
+- **What you'll see in the logs during replay:**
+
+  ```text
+  TOAST: scanning body store at "/var/lib/tuber/binlog/toast"
+  TOAST scan: segment 87/320, 5.43 GiB / 19.84 GiB (27%), 412384 bodies indexed
+  …
+  WAL: replaying 1247 segments / 12.18 GiB from "/var/lib/tuber/binlog" (not yet accepting connections)
+  WAL replay: segment 412/1247, 4.01 GiB / 12.18 GiB (32%), 891204 jobs so far
+  …
+  WAL: replayed 2480915 jobs and 1289 idempotency tombstones from "/var/lib/tuber/binlog"
+  tuber v0.6.2 [splat-booko] listening on 0.0.0.0:11300 …
+  ```
+
+  Progress lines are time-throttled to one every ~5 s, so they don't drown the log on small WALs.
+
 ### Statistics
 
 Most job queue systems treat performance monitoring as the application's problem. Tuber tracks it at the broker, per tube, with no external tooling required:
@@ -211,9 +199,9 @@ put 100 0 30 5 idp:my-key
 → INSERTED 1 READY       (dedup hit — job is ready)
 ```
 
-#### Priority Escalation
+#### Priority Ratchet
 
-If a duplicate `put` arrives with a higher priority (lower number) than the existing job, the job's priority is upgraded and the new priority is included in the response:
+If a duplicate `put` arrives with a more urgent priority (lower number) than the existing job, the job's priority ratchets down and the new value is included in the response:
 
 ```text
 put 100 0 30 5 idp:my-key
@@ -222,14 +210,14 @@ put 100 0 30 5 idp:my-key
 
 put 50 0 30 5 idp:my-key
 <body>
-→ INSERTED 1 READY 50    (dedup hit — priority upgraded to 50)
+→ INSERTED 1 READY 50    (dedup hit — priority ratcheted to 50)
 
 put 200 0 30 5 idp:my-key
 <body>
-→ INSERTED 1 READY       (dedup hit — priority NOT downgraded)
+→ INSERTED 1 READY       (dedup hit — ratchet holds, no change)
 ```
 
-Priority can only increase (lower number), never decrease — this prevents flapping when multiple producers disagree. The upgrade applies regardless of job state (ready, reserved, delayed, or buried); for non-ready jobs, the new priority takes effect on the next state transition.
+The priority ratchets down (more urgent), never up — this prevents flapping when multiple producers disagree. The ratchet applies regardless of job state (ready, reserved, delayed, or buried); for non-ready jobs, the new priority takes effect on the next state transition.
 
 The response state tells you exactly what happened to the original job:
 
@@ -237,13 +225,13 @@ The response state tells you exactly what happened to the original job:
 |---|---|
 | `INSERTED <id>` | Fresh insert, new job created |
 | `INSERTED <id> READY` | Dedup hit — original job is waiting to be reserved |
-| `INSERTED <id> READY <pri>` | Dedup hit — priority upgraded to `<pri>` |
+| `INSERTED <id> READY <pri>` | Dedup hit — priority ratcheted to `<pri>` |
 | `INSERTED <id> RESERVED` | Dedup hit — original job is being processed |
-| `INSERTED <id> RESERVED <pri>` | Dedup hit — priority upgraded (applies on release) |
+| `INSERTED <id> RESERVED <pri>` | Dedup hit — priority ratcheted (applies on release) |
 | `INSERTED <id> DELAYED` | Dedup hit — original job is delayed |
-| `INSERTED <id> DELAYED <pri>` | Dedup hit — priority upgraded (applies when ready) |
+| `INSERTED <id> DELAYED <pri>` | Dedup hit — priority ratcheted (applies when ready) |
 | `INSERTED <id> BURIED` | Dedup hit — original job is buried |
-| `INSERTED <id> BURIED <pri>` | Dedup hit — priority upgraded (applies on kick) |
+| `INSERTED <id> BURIED <pri>` | Dedup hit — priority ratcheted (applies on kick) |
 | `INSERTED <id> DELETED` | Dedup hit during TTL cooldown (see below) |
 
 The state suffix only appears on dedup hits — a `put` without `idp:` always returns plain `INSERTED <id>`, keeping the response fully backwards-compatible with standard beanstalkd clients.
@@ -372,6 +360,28 @@ delete-batch 1 2 3 99
 ```
 
 Returns `DELETED_BATCH <deleted_count> <not_found_count>` — here 3 jobs were deleted and 1 was not found.
+
+## As A Workqueue for the Shell
+
+```bash
+# Start the server
+tuber server
+
+# Put a job
+tuber put "echo hello world"
+
+# Put jobs from stdin (one per line)
+echo -e "job1\njob2\njob3" | tuber put
+
+# Process jobs (reserves and runs each job body as a shell command)
+tuber work
+
+# List tubes
+tuber tubes
+
+# Check stats
+tuber stats
+```
 
 ## Installation
 
@@ -643,6 +653,19 @@ To install it globally in Claude Code:
 ```bash
 ln -s "$(pwd)/skill" ~/.claude/skills/tuber
 ```
+
+## How was this built?
+
+Every line of Rust in this project was written by Claude Opus 4.6. The architecture, testing strategy, and design decisions were human-driven.  I program in Ruby, I have programmed in C, Java and PHP - I have never programmed in Rust.
+
+I used Beanstalkd's C source code and tests as the foundation, first building a minimal working version, duplicating the tests, then incrementally adding the new extensions.
+
+The docs/ directory contains the working files we used to plan and describe the implementation.
+
+I use Beanstalkd in production at [Booko](https://booko.au) in several places requiring queues.  It's working very well.  Claude Code can use the tuber-cli to interact with the queue, finding buried (failed) jobs, which helps with debugging. 
+
+Read more about it [on my blog](https://da.nmilne.com/shipping-a-job-queue-system-without-reading-the-source-code/).
+
 
 ## License
 
